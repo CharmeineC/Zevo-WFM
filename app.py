@@ -54,10 +54,9 @@ DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 ONE_DAY = dt.timedelta(days=1)
 TIME_RE = r"^$|^([01]\d|2[0-3]):[0-5]\d$"
 LOBS = ["Voice", "Non-Voice"]
-LEAVE_TYPES = [
-    "Vacation Leave (VL)", "Sick Leave (SL)", "Emergency Leave (EL)",
-    "Bereavement Leave (BL)", "Maternity/Paternity (ML)", "Solo Parent Leave (SPL)",
-    "Leave Without Pay (LWOP)",
+LEAVE_TYPES = [  # contractors: time off is unpaid, so no credits/balances are tracked
+    "Planned Time Off (PTO)", "Sick (SL)", "Emergency (EL)", "Bereavement (BL)",
+    "Personal / Other (OFF)",
 ]
 ATT_STATUS = ["", "Present", "Late", "Undertime", "Half-day", "Absent", "NCNS", "On Leave", "Rest Day"]
 PRESENT_STATUS = ["Present", "Late", "Undertime", "Half-day"]
@@ -72,6 +71,11 @@ DEFAULT_SETTINGS = {
     "max_weekly_ot_hrs": "12", # weekly OT cap per agent
     "ot_block_min": "30",      # rendered OT counted in blocks of N minutes
     "forecast_weeks": "6",     # same-weekday history used for the interval forecast
+    "shift_hours": "9",        # hours a person is on site per shift (incl. lunch) -> daily HC from volume
+    "ot_min_block_hrs": "1",   # shortest OT block the OT plan will offer
+    "ot_max_ext_hrs": "4",     # longest pre/post-shift extension
+    "rd_ot_max_hrs": "9",      # longest rest-day OT block
+    "ot_min_eff_pct": "60",    # an OT block must spend at least this % of its time in short intervals
     "site_tz": "Asia/Manila",  # timezone schedules are written in
 }
 CHANNELS = ["Voice", "Chat", "Email / Back Office"]
@@ -114,7 +118,7 @@ CREATE TABLE IF NOT EXISTS leaves(
 CREATE TABLE IF NOT EXISTS ot_requests(
   id INTEGER PRIMARY KEY AUTOINCREMENT, agent_id INTEGER, date TEXT, ot_type TEXT,
   start_time TEXT, end_time TEXT, hours REAL, reason TEXT, status TEXT DEFAULT 'Pending',
-  covering_for INTEGER, filed_on TEXT);
+  covering_for INTEGER, filed_on TEXT, for_account TEXT);
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
 """
 
@@ -265,10 +269,11 @@ class SheetStore:
 def init_db():
     with closing(_conn()) as c, c:
         c.executescript(SCHEMA)
-        have = {r[1] for r in c.execute("PRAGMA table_info(accounts)")}
-        for col, typ in ACCOUNT_EXTRA_COLS.items():  # upgrade databases made by older versions
-            if col not in have:
-                c.execute(f"ALTER TABLE accounts ADD COLUMN {col} {typ}")
+        for table, extra in (("accounts", ACCOUNT_EXTRA_COLS), ("ot_requests", {"for_account": "TEXT"})):
+            have = {r[1] for r in c.execute(f"PRAGMA table_info({table})")}
+            for col, typ in extra.items():  # upgrade databases made by older versions
+                if col not in have:
+                    c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
 
 
 def ensure_default_settings():
@@ -605,6 +610,9 @@ def page_dashboard(acct):
     m = sch.merge(att, on="agent_id", how="left")
     cov = q("SELECT a.account FROM ot_requests o JOIN agents a ON a.id=o.covering_for "
             "WHERE o.date=? AND o.status='Approved'", (str(day),))
+    ot_hrs = q("SELECT COALESCE(o.for_account, c.account, a.account) AS account, SUM(o.hours) AS h "
+               "FROM ot_requests o JOIN agents a ON a.id=o.agent_id LEFT JOIN agents c ON c.id=o.covering_for "
+               "WHERE o.date=? AND o.status='Approved' GROUP BY 1", (str(day),))
     req = q("SELECT name AS account, required_hc FROM accounts")
     rows = []
     for acc, g in m.groupby("account"):
@@ -612,25 +620,38 @@ def page_dashboard(acct):
         present = int(sched.status.isin(PRESENT_STATUS).sum())
         absent = int(sched.status.isin(ABSENT_STATUS).sum())
         covers = int((cov.account == acc).sum())
-        rhc = req[req.account == acc].required_hc
-        rhc = int(rhc.iloc[0]) if len(rhc) else 0
+        vol_req, peak, short_iv = required_day_hc(acc, day)
+        if vol_req is None:  # no volume history yet -> manual number from Accounts
+            rhc = req[req.account == acc].required_hc
+            rhc, src = (int(rhc.iloc[0]) if len(rhc) and pd.notna(rhc.iloc[0]) else 0), "manual"
+        else:
+            rhc, src = vol_req, "volume"
         projected = len(sched) - absent + covers
-        rows.append({"Account": acc, "LOB": g.lob.iloc[0], "Required": rhc, "Scheduled": len(sched),
-                     "On leave": int((g.kind == "Leave").sum()), "Rest day": int((g.kind == "Rest Day").sum()),
+        oh = ot_hrs[ot_hrs.account == acc].h
+        rows.append({"Account": acc, "LOB": g.lob.iloc[0], "Required": rhc, "Req. from": src,
+                     "Peak interval HC": round(peak, 1) if peak is not None else None,
+                     "Scheduled": len(sched), "Time off": int((g.kind == "Leave").sum()),
+                     "Rest day": int((g.kind == "Rest Day").sum()),
                      "Present": present, "Late": int((sched.late_min.fillna(0) > 0).sum()),
                      "Absent/NCNS": absent, "Cover OT in": covers,
-                     "Projected HC": projected, "Variance": projected - rhc})
+                     "OT hrs": round(float(oh.iloc[0]), 1) if len(oh) else 0.0,
+                     "Projected HC": projected, "Variance": projected - rhc,
+                     "Short intervals": short_iv})
     summ = pd.DataFrame(rows)
     c = st.columns(6)
     c[0].metric("Scheduled", int(summ.Scheduled.sum()))
     c[1].metric("Present", int(summ.Present.sum()))
     c[2].metric("Late", int(summ.Late.sum()))
     c[3].metric("Absent/NCNS", int(summ["Absent/NCNS"].sum()))
-    c[4].metric("On leave", int(summ["On leave"].sum()))
+    c[4].metric("Time off", int(summ["Time off"].sum()))
     c[5].metric("HC variance", int(summ.Variance.sum()))
     st.subheader("Staffing by account")
     st.dataframe(summ.style.map(lambda v: "color:#c0392b;font-weight:600" if isinstance(v, (int, float)) and v < 0 else "",
-                                subset=["Variance"]), hide_index=True, width="stretch")
+                                subset=["Variance"]).format(precision=1, na_rep="—"), hide_index=True, width="stretch")
+    st.caption(f"**Required** comes from the volume forecast (total interval need ÷ {setting('shift_hours'):g}h shifts) "
+               "when the account has volume history, otherwise from the manual number in Accounts. "
+               "**Short intervals** = 30-min intervals below need even after approved OT — fix them in "
+               "**Interval Planner → OT plan**.")
 
     st.subheader("Open gaps (no coverage yet)")
     gaps = open_gaps(day, acct)
@@ -794,10 +815,10 @@ def page_attendance(acct):
 
 
 def page_leaves(acct):
-    st.header("🌴 Leave Management")
+    st.header("🌴 Time Off")
     ag = agents_df(True, acct)
     labels = agent_label_map(ag)
-    t1, t2, t3, t4 = st.tabs(["File leave", "Pending approvals", "Leave calendar", "Balances"])
+    t1, t2, t3, t4 = st.tabs(["File time off", "Pending approvals", "Time-off calendar", "Summary"])
     with t1:
         if not labels:
             st.info("No agents yet.")
@@ -805,7 +826,7 @@ def page_leaves(acct):
             aid = st.selectbox("Agent", list(labels), format_func=labels.get, key="lv_agent")
             arow = ag[ag.id == aid].iloc[0]
             c = st.columns(3)
-            ltype = c[0].selectbox("Leave type", LEAVE_TYPES)
+            ltype = c[0].selectbox("Type", LEAVE_TYPES)
             d1 = c[1].date_input("From", dt.date.today() + ONE_DAY, key="lv_d1")
             d2 = c[2].date_input("To", dt.date.today() + ONE_DAY, key="lv_d2")
             reason = st.text_input("Reason")
@@ -820,14 +841,14 @@ def page_leaves(acct):
                                + ", ".join(over.date))
                 with st.expander("Leave load for these dates"):
                     st.dataframe(load, hide_index=True)
-            if st.button("Submit leave", type="primary"):
+            if st.button("Submit time off", type="primary"):
                 if d2 < d1:
                     st.error("End date is before start date.")
                 else:
                     ex("INSERT INTO leaves(agent_id,leave_type,start_date,end_date,days,status,reason,filed_on) "
                        "VALUES(?,?,?,?,?,?,?,?)", (aid, ltype, str(d1), str(d2), days, "Pending", reason,
                                                    str(dt.date.today())))
-                    st.success("Leave filed — waiting for approval.")
+                    st.success("Time off filed — waiting for approval.")
     with t2:
         pend = q("SELECT l.*, a.name, a.account FROM leaves l JOIN agents a ON a.id=l.agent_id "
                  "WHERE l.status='Pending' ORDER BY l.start_date")
@@ -868,20 +889,19 @@ def page_leaves(acct):
                 ex("UPDATE leaves SET status='Cancelled' WHERE id=?", (r.id,))
             rerun()
     with t4:
-        yr = dt.date.today().year
+        c = st.columns(2)
+        s1 = c[0].date_input("From", dt.date.today().replace(month=1, day=1), key="lvs1")
+        s2 = c[1].date_input("To", dt.date.today().replace(month=12, day=31), key="lvs2")
         used = q("SELECT agent_id, leave_type, SUM(days) d FROM leaves WHERE status='Approved' "
-                 "AND substr(start_date,1,4)=? GROUP BY agent_id, leave_type", (str(yr),))
-        bal = ag[["id", "emp_id", "name", "account", "vl_credits", "sl_credits"]].copy()
-
-        def used_of(aid, abbr):
-            u = used[(used.agent_id == aid) & used.leave_type.str.contains(f"({abbr})", regex=False)]
-            return float(u.d.sum())
-        bal["vl_used"] = [used_of(i, "VL") for i in bal.id]
-        bal["sl_used"] = [used_of(i, "SL") for i in bal.id]
-        bal["vl_left"] = bal.vl_credits - bal.vl_used
-        bal["sl_left"] = bal.sl_credits - bal.sl_used
-        st.caption(f"Approved leave used in {yr}. Edit credits under Roster.")
-        st.dataframe(bal.drop(columns="id"), hide_index=True, width="stretch")
+                 "AND start_date<=? AND end_date>=? GROUP BY agent_id, leave_type", (str(s2), str(s1)))
+        summ = ag[["id", "emp_id", "name", "account"]].merge(
+            used.pivot_table(index="agent_id", columns="leave_type", values="d", aggfunc="sum").reset_index()
+            if len(used) else pd.DataFrame(columns=["agent_id"]), left_on="id", right_on="agent_id", how="left")
+        summ = summ.drop(columns=["id", "agent_id"]).fillna(0)
+        type_cols = [c for c in summ.columns if c not in ("emp_id", "name", "account")]
+        summ["total_days_off"] = summ[type_cols].sum(axis=1) if type_cols else 0
+        st.caption("Approved days off per contractor (working days only). Use it to spot frequent absences.")
+        st.dataframe(summ.sort_values("total_days_off", ascending=False), hide_index=True, width="stretch")
 
 
 def page_coverage(acct):
@@ -1072,8 +1092,7 @@ def page_roster():
                                 "shift_start": st.column_config.TextColumn("Shift start", validate=TIME_RE),
                                 "shift_end": st.column_config.TextColumn("Shift end", validate=TIME_RE),
                                 "rest_days": st.column_config.TextColumn("Rest days"),
-                                "vl_credits": st.column_config.NumberColumn("VL credits"),
-                                "sl_credits": st.column_config.NumberColumn("SL credits"),
+                                "vl_credits": None, "sl_credits": None,  # contractors: no leave credits
                             })
         if st.button("💾 Save roster", type="primary"):
             errs = []
@@ -1102,13 +1121,13 @@ def page_roster():
                 st.success("Roster saved." + (f" {len(removed)} removed row(s) set inactive." if removed else ""))
     with t2:
         acc = q("SELECT * FROM accounts ORDER BY name")
-        st.caption("**Required HC** = agents needed on the floor per day (daily dashboard) · **Max leave %** = share of "
+        st.caption("**Required HC** is calculated from volume (Interval Planner); the manual number is only a fallback for accounts without volume data · **Max leave %** = share of "
                    "headcount allowed on leave the same day. The interval columns drive the **Interval Planner**: "
                    "leave them blank to use sensible defaults for the channel.")
         ed = st.data_editor(acc, num_rows="dynamic", hide_index=True, key="acc_ed", column_config={
             "name": st.column_config.TextColumn("Account", required=True),
             "lob": st.column_config.SelectboxColumn("LOB", options=LOBS),
-            "required_hc": st.column_config.NumberColumn("Required HC/day"),
+            "required_hc": st.column_config.NumberColumn("Manual required HC/day", help="Only used when the account has no volume history; otherwise required HC is calculated from volume"),
             "max_leave_pct": st.column_config.NumberColumn("Max leave %"),
             "channel": st.column_config.SelectboxColumn("Channel", options=CHANNELS,
                                                         help="Voice & Chat use Erlang C; Email/Back Office uses workload"),
@@ -1127,11 +1146,10 @@ def page_roster():
                 ex("DELETE FROM accounts WHERE name=?", (n,))
             st.success("Accounts saved.")
     with t3:
-        st.write("Columns: `emp_id, name, account, lob, team_lead, skills, shift_start, shift_end, rest_days, "
-                 "vl_credits, sl_credits`")
+        st.write("Columns: `emp_id, name, account, lob, team_lead, skills, shift_start, shift_end, rest_days`")
         tmpl = pd.DataFrame([dict(emp_id="10001", name="Juan Dela Cruz", account="Telco Inbound", lob="Voice",
                                   team_lead="TL Santos", skills="Billing,Tech", shift_start="22:00",
-                                  shift_end="07:00", rest_days="Sat,Sun", vl_credits=12, sl_credits=12)])
+                                  shift_end="07:00", rest_days="Sat,Sun")])
         st.download_button("Download template", tmpl.to_csv(index=False), "roster_template.csv")
         up = st.file_uploader("Upload roster CSV", type="csv")
         if up is not None and st.button("Import"):
@@ -1228,6 +1246,19 @@ def page_settings():
         tz_now = setting_str("site_tz")
         vals["site_tz"] = c[1].selectbox("Site timezone (your schedules)", COMMON_TZ,
                                          index=COMMON_TZ.index(tz_now) if tz_now in COMMON_TZ else 0)
+        vals["shift_hours"] = c[2].number_input("Shift length incl. lunch (h)", 1.0, 16.0, setting("shift_hours"),
+                                                step=0.5, help="Used to turn interval need into daily headcount")
+        st.markdown("**OT plan rules**")
+        c = st.columns(4)
+        vals["ot_min_block_hrs"] = c[0].number_input("Shortest OT block (h)", 0.5, 12.0, setting("ot_min_block_hrs"),
+                                                     step=0.5)
+        vals["ot_max_ext_hrs"] = c[1].number_input("Longest pre/post-shift OT (h)", 0.5, 12.0,
+                                                   setting("ot_max_ext_hrs"), step=0.5)
+        vals["rd_ot_max_hrs"] = c[2].number_input("Longest rest-day OT (h)", 0.5, 16.0, setting("rd_ot_max_hrs"),
+                                                  step=0.5)
+        vals["ot_min_eff_pct"] = c[3].number_input("Min % of block in short intervals", 10.0, 100.0,
+                                                   setting("ot_min_eff_pct"), step=5.0,
+                                                   help="Higher = less OT spent in intervals that are already covered")
         if st.form_submit_button("Save settings"):
             for k, v in vals.items():
                 ex("INSERT OR REPLACE INTO settings VALUES(?,?)", (k, str(v)))
@@ -1353,13 +1384,43 @@ def forecast_day(account, day, weeks=None, adj_pct=0.0):
     return out, dates
 
 
+def place_ot(d, start, end, base_shift):
+    """Datetime window of an OT record. Post-shift OT after a graveyard shift lands on the next calendar day."""
+    cands = [shift_window(d + dt.timedelta(days=k), start, end) for k in (0, 1)]
+    if base_shift and base_shift[0] is not None:
+        s0, e0 = base_shift
+        cands.sort(key=lambda w: max((w[0] - e0).total_seconds(), (s0 - w[1]).total_seconds(), 0))
+    return cands[0]
+
+
+def cover_vec(day, windows):
+    """Headcount each 30-min interval of `day` gets from a list of (start, end) windows (partial = fraction)."""
+    t0 = dt.datetime.combine(day, dt.time())
+    vec = np.zeros(len(INTERVALS))
+    for s, e in windows:
+        if s is None:
+            continue
+        a, b = (s - t0).total_seconds() / INTERVAL_SEC, (e - t0).total_seconds() / INTERVAL_SEC
+        for i in range(max(0, math.floor(a)), min(len(INTERVALS), math.ceil(b))):
+            vec[i] += max(0.0, min(b, i + 1) - max(a, i))
+    return vec
+
+
+def ot_target(r):
+    """Account an approved OT row counts toward: explicit, else the covered agent's, else the agent's own."""
+    for v in (getattr(r, "for_account", None), getattr(r, "cov", None), getattr(r, "own", None)):
+        if isinstance(v, str) and v:
+            return v
+    return None
+
+
 def scheduled_by_interval(account, day):
-    """Bodies on shift per interval: scheduled shifts − leaves − absences + approved OT/coverage."""
+    """Bodies on shift per interval: scheduled shifts − time off − absences + approved OT/coverage."""
     sch = build_schedule(day - ONE_DAY, day)
     att = q("SELECT agent_id, date, status FROM attendance WHERE date BETWEEN ? AND ?",
             (str(day - ONE_DAY), str(day)))
     absent = {(int(a), d) for a, d, s in zip(att.agent_id, att.date, att.status) if s in ABSENT_STATUS}
-    ot = q("SELECT o.agent_id, o.date, o.start_time, o.end_time, a.account AS own, c.account AS cov "
+    ot = q("SELECT o.agent_id, o.date, o.start_time, o.end_time, o.for_account, a.account AS own, c.account AS cov "
            "FROM ot_requests o JOIN agents a ON a.id=o.agent_id LEFT JOIN agents c ON c.id=o.covering_for "
            "WHERE o.status='Approved' AND o.date BETWEEN ? AND ?", (str(day - ONE_DAY), str(day)))
     ot_keys = {(int(a), d) for a, d in zip(ot.agent_id, ot.date)}
@@ -1372,23 +1433,11 @@ def scheduled_by_interval(account, day):
         if r.kind == "Work" or (r.kind == "Work (RD OT)" and (r.agent_id, r.date) not in ot_keys):
             windows.append(own_shift[(r.agent_id, r.date)])
     for r in ot.itertuples():
-        target = r.cov if isinstance(r.cov, str) and r.cov else r.own
-        if target != account or not r.start_time or not r.end_time:
+        if ot_target(r) != account or not r.start_time or not r.end_time:
             continue
-        d = dt.date.fromisoformat(r.date)
-        cands = [shift_window(d + dt.timedelta(days=k), r.start_time, r.end_time) for k in (0, 1)]
-        base_shift = own_shift.get((int(r.agent_id), r.date))
-        if base_shift and base_shift[0] is not None:  # post-shift OT after a graveyard shift lands the next day
-            s0, e0 = base_shift
-            cands.sort(key=lambda w: max((w[0] - e0).total_seconds(), (s0 - w[1]).total_seconds(), 0))
-        windows.append(cands[0])
-    t0 = dt.datetime.combine(day, dt.time())
-    step = dt.timedelta(minutes=INTERVAL_MIN)
-    out = []
-    for i in range(len(INTERVALS)):
-        a, b = t0 + i * step, t0 + (i + 1) * step
-        out.append(sum(max(0.0, (min(e, b) - max(s, a)).total_seconds()) for s, e in windows if s) / INTERVAL_SEC)
-    return np.array(out)
+        windows.append(place_ot(dt.date.fromisoformat(r.date), r.start_time, r.end_time,
+                                own_shift.get((int(r.agent_id), r.date))))
+    return cover_vec(day, windows)
 
 
 def interval_plan(account, day, adj_pct=0.0, weeks=None):
@@ -1406,6 +1455,163 @@ def interval_plan(account, day, adj_pct=0.0, weeks=None):
     act = q("SELECT interval, volume FROM interval_volume WHERE account=? AND date=?", (account, str(day)))
     df["actual_volume"] = df.interval.map(dict(zip(act.interval, pd.to_numeric(act.volume, errors="coerce"))))
     return df, used, p
+
+
+def required_day_hc(account, day):
+    """Daily headcount implied by the volume forecast: total interval need ÷ shift length.
+    Returns (required HC, peak interval HC, short intervals) or (None, None, None) without history."""
+    df, used, _ = interval_plan(account, day)
+    if not used:
+        return None, None, None
+    need = df.required_hc.sum() * INTERVAL_MIN / 60 / max(setting("shift_hours"), 1)
+    return int(math.ceil(need - 1e-9)), float(df.required_hc.max()), int((df.variance < -0.5).sum())
+
+
+def _hours(td):
+    return td.total_seconds() / 3600
+
+
+def _fits(s, e, blocks, min_rest_h, max_daily_h):
+    """Can an OT window [s, e) be added to an agent's existing work blocks without breaking the rules?"""
+    blocks = [b for b in blocks if b and b[0] is not None]
+    if any(bs < e and s < be for bs, be in blocks):
+        return False
+    merged = []
+    for a, b in sorted(blocks + [(s, e)]):
+        if merged and a <= merged[-1][1]:  # touching = one continuous stretch of work
+            merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+        else:
+            merged.append((a, b))
+    k = next(i for i, (a, b) in enumerate(merged) if a <= s and e <= b)
+    a, b = merged[k]
+    if _hours(b - a) > max_daily_h + 1e-9:
+        return False
+    if k > 0 and _hours(a - merged[k - 1][1]) < min_rest_h:
+        return False
+    if k + 1 < len(merged) and _hours(merged[k + 1][0] - b) < min_rest_h:
+        return False
+    return True
+
+
+def _steps(lo, hi):
+    return [x / 2 for x in range(max(1, int(round(lo * 2))), int(round(hi * 2)) + 1)]
+
+
+def plan_ot(account, day, adj_pct=0.0, weeks=None, include_other=False, skill=""):
+    """Recommend OT blocks (pre-shift, post-shift, rest-day) that fill short intervals on `day`,
+    keeping everyone's permanent schedule as is and respecting rest, max-hours and weekly OT cap rules."""
+    df, used, p = interval_plan(account, day, adj_pct, weeks)
+    req, sched0 = df.required_hc.values, df.scheduled_hc.values
+    min_rest, max_daily, cap = setting("min_rest_hrs"), setting("max_daily_hrs"), setting("max_weekly_ot_hrs")
+    min_blk, max_ext, rd_max = setting("ot_min_block_hrs"), setting("ot_max_ext_hrs"), setting("rd_ot_max_hrs")
+    min_eff = setting("ot_min_eff_pct") / 100
+    lob_df = q("SELECT lob FROM accounts WHERE name=?", (account,))
+    lob = lob_df.lob[0] if len(lob_df) else None
+    sch = build_schedule(day - 2 * ONE_DAY, day + ONE_DAY)
+    att = q("SELECT agent_id, date, status FROM attendance WHERE date BETWEEN ? AND ?",
+            (str(day - ONE_DAY), str(day)))
+    absent = {(int(a), d) for a, d, s in zip(att.agent_id, att.date, att.status) if s in ABSENT_STATUS}
+    ot = q("SELECT agent_id, date, start_time, end_time FROM ot_requests WHERE status IN ('Approved','Pending') "
+           "AND date BETWEEN ? AND ?", (str(day - 2 * ONE_DAY), str(day + ONE_DAY)))
+    otw, skill_l, t0 = weekly_ot(day), (skill or "").strip().lower(), dt.datetime.combine(day, dt.time())
+    blocks, info, cands = {}, {}, []
+    for aid, g in sch.groupby("agent_id"):
+        aid = int(aid)
+        first = g.iloc[0]
+        same = first.account == account
+        if not same and not (include_other and first.lob == lob):
+            continue
+        if skill_l and skill_l not in str(first.skills or "").lower():
+            continue
+        rows = {r.date: r for r in g.itertuples()}
+        today = rows.get(str(day))
+        if today is None or today.kind in ("Leave", "Holiday") or (aid, str(day)) in absent:
+            continue
+        shifts = {d: shift_window(dt.date.fromisoformat(d), r.shift_start, r.shift_end)
+                  for d, r in rows.items() if r.kind in WORK_KINDS}
+        blocks[aid] = list(shifts.values()) + [
+            place_ot(dt.date.fromisoformat(r.date), r.start_time, r.end_time, shifts.get(r.date))
+            for r in ot[ot.agent_id == aid].itertuples() if r.start_time and r.end_time]
+        info[aid] = dict(name=first["name"], emp_id=first.emp_id, home_account=first.account, same=same)
+        opts = []
+        for dstr in (str(day - ONE_DAY), str(day)):  # extend yesterday's graveyard shift or today's shift
+            r = rows.get(dstr)
+            if r is None or r.kind not in ("Work", "Work (RD OT)") or (aid, dstr) in absent:
+                continue
+            s, e = shifts[dstr]
+            for h in _steps(min_blk, max_ext):
+                opts.append(("Pre-shift OT", dstr, s - dt.timedelta(hours=h), s))
+                opts.append(("Post-shift OT", dstr, e, e + dt.timedelta(hours=h)))
+        if today.kind == "Rest Day":
+            for i in range(len(INTERVALS)):
+                ws = t0 + dt.timedelta(minutes=INTERVAL_MIN * i)
+                for h in _steps(min_blk, rd_max):
+                    we = ws + dt.timedelta(hours=h)
+                    if we > t0 + ONE_DAY:
+                        break
+                    opts.append(("Rest Day OT", str(day), ws, we))
+        for typ, dstr, s, e in opts:
+            vec = cover_vec(day, [(s, e)])
+            if vec.sum() > 0:
+                cands.append(dict(agent_id=aid, ot_type=typ, date=dstr, start=s, end=e, hours=_hours(e - s), vec=vec))
+
+    sched = sched0.astype(float).copy()
+    short = np.maximum(0, req - sched)
+    planned, rd_used, picks, valid = {}, {}, [], {}
+    for _ in range(300):
+        best, best_score = None, 0.0
+        for i, c in enumerate(cands):
+            aid = c["agent_id"]
+            if otw.get(aid, 0) + planned.get(aid, 0) + c["hours"] > cap + 1e-9:
+                continue
+            if c["ot_type"] == "Rest Day OT" and rd_used.get(aid, 0) + c["hours"] > rd_max + 1e-9:
+                continue  # rest-day OT limit is per person per day, not per block
+            gain = float(np.minimum(c["vec"], short).sum()) * INTERVAL_MIN / 60  # short HC-hours it fills
+            if gain <= 0 or gain / c["hours"] < min_eff:
+                continue
+            if i not in valid:
+                valid[i] = _fits(c["start"], c["end"], blocks[aid], min_rest, max_daily)
+            if not valid[i]:
+                continue
+            score = gain - 0.5 * (c["hours"] - gain) + (0.3 if info[aid]["same"] else 0) \
+                - 0.02 * (otw.get(aid, 0) + planned.get(aid, 0))
+            if score > best_score:
+                best, best_score, best_gain = i, score, gain
+        if best is None:
+            break
+        c = cands[best]
+        aid = c["agent_id"]
+        sched += c["vec"]
+        short = np.maximum(0, req - sched)
+        blocks[aid] = blocks[aid] + [(c["start"], c["end"])]
+        planned[aid] = planned.get(aid, 0) + c["hours"]
+        if c["ot_type"] == "Rest Day OT":
+            rd_used[aid] = rd_used.get(aid, 0) + c["hours"]
+        valid = {k: v for k, v in valid.items() if cands[k]["agent_id"] != aid}
+        picks.append(dict(agent_id=aid, ot_type=c["ot_type"], shift_date=c["date"], _s=c["start"], _e=c["end"],
+                          fills_short_hrs=best_gain))
+    # join back-to-back blocks for the same person into one block
+    merged = []
+    for pk in sorted(picks, key=lambda x: (x["agent_id"], x["_s"])):
+        last = merged[-1] if merged else None
+        if last and last["agent_id"] == pk["agent_id"] and last["ot_type"] == pk["ot_type"] \
+                and last["shift_date"] == pk["shift_date"] and last["_e"] == pk["_s"]:
+            last["_e"], last["fills_short_hrs"] = pk["_e"], last["fills_short_hrs"] + pk["fills_short_hrs"]
+        else:
+            merged.append(dict(pk))
+    rows = []
+    for pk in merged:
+        aid = pk["agent_id"]
+        rows.append(dict(agent_id=aid, name=info[aid]["name"], emp_id=info[aid]["emp_id"],
+                         home_account=info[aid]["home_account"], ot_type=pk["ot_type"], shift_date=pk["shift_date"],
+                         start=pk["_s"].strftime("%H:%M"), end=pk["_e"].strftime("%H:%M"),
+                         hours=_hours(pk["_e"] - pk["_s"]), fills_short_hrs=round(pk["fills_short_hrs"], 1),
+                         week_ot_after=round(otw.get(aid, 0) + planned[aid], 1), _s=pk["_s"]))
+    plan = pd.DataFrame(rows, columns=["agent_id", "name", "emp_id", "home_account", "ot_type", "shift_date",
+                                       "start", "end", "hours", "fills_short_hrs", "week_ot_after", "_s"])
+    plan = plan.sort_values(["_s", "name"]).drop(columns="_s").reset_index(drop=True)
+    curve = pd.DataFrame({"interval": INTERVALS, "required_hc": req, "scheduled_now": sched0, "with_ot_plan": sched})
+    return plan, curve, used
 
 
 def normalize_volume(df, source_tz, site_tz, default_aht):
@@ -1493,7 +1699,7 @@ def page_interval(acct):
                + (f" · {p['conc']:g} chats at once" if p["channel"] == "Chat" else "")
                + f" · max occupancy {p['max_occ']:g}% · shrinkage {p['shrink']:g}% · times in "
                f"{setting_str('site_tz')} · change these under Roster & Accounts → Accounts")
-    t1, t2, t3 = st.tabs(["Day view", "Week heatmap", "Volume data"])
+    t1, t_ot, t2, t3 = st.tabs(["Day view", "🧮 OT plan", "Week heatmap", "Volume data"])
 
     with t1:
         df, used, p = interval_plan(account, day, adj, weeks)
@@ -1516,7 +1722,7 @@ def page_interval(acct):
             worst = df.loc[df.variance.idxmin()]
             m[2].metric("Worst interval", f"{worst.variance:+.1f}", f"at {worst.interval}", delta_color="off")
         m[3].metric("Understaffed intervals", len(short),
-                    f"{max(0.0, -short.variance.sum()) * INTERVAL_MIN / 60:.1f} HC-hours short", delta_color="off")
+                    f"{np.maximum(0, -df.variance).sum() * INTERVAL_MIN / 60:.1f} HC-hours short", delta_color="off")
         m[4].metric("Projected SL (day)", f"{day_sl:.0%}" if day_sl is not None else "—",
                     f"target {p['sl_pct']:g}%" if day_sl is not None else None, delta_color="off")
 
@@ -1568,8 +1774,89 @@ def page_interval(acct):
                              "Proj. SL %", help="Service level if scheduled HC (after shrinkage) works the forecast")})
         st.download_button("⬇️ Download interval plan (CSV)", df.to_csv(index=False),
                            f"interval_plan_{account}_{day}.csv")
-        st.caption("Short in some intervals? Use **Coverage Finder** with a partial window (e.g. 01:00–04:00) to "
-                   "add pre/post-shift OT exactly where it's needed.")
+        st.caption("Short in some intervals? Open the **🧮 OT plan** tab to get OT recommendations that fill them.")
+
+    with t_ot:
+        st.caption("Schedules stay as they are. This finds the short intervals and suggests **who should do OT and "
+                   "exactly when** — extending a shift (pre/post) or a rest-day block — within your rules: "
+                   f"min rest {setting('min_rest_hrs'):g}h · max {setting('max_daily_hrs'):g}h straight · "
+                   f"weekly OT cap {setting('max_weekly_ot_hrs'):g}h · blocks {setting('ot_min_block_hrs'):g}–"
+                   f"{setting('ot_max_ext_hrs'):g}h (rest day up to {setting('rd_ot_max_hrs'):g}h) · "
+                   f"at least {setting('ot_min_eff_pct'):g}% of each block in short intervals. Change these in Settings.")
+        c = st.columns([1.4, 1.4, 1])
+        other = c[0].toggle("Also use agents from other accounts (same LOB)", False, key="otp_other")
+        skill = c[1].text_input("Only agents with skill (optional)", "", key="otp_skill")
+        key = (account, str(day), adj, weeks, other, skill)
+        if c[2].button("🧮 Build OT plan", type="primary", width="stretch"):
+            with st.spinner("Matching OT to short intervals…"):
+                st.session_state["ot_plan"] = (key, plan_ot(account, day, adj, weeks, other, skill))
+        saved = st.session_state.get("ot_plan")
+        if not saved or saved[0] != key:
+            st.info("Click **Build OT plan** to get recommendations for this account and date.")
+        else:
+            plan, curve, used = saved[1]
+            if not used:
+                st.warning("No volume history for this weekday yet, so there's no requirement to plan against.")
+            keep_h = INTERVAL_MIN / 60
+            before = float(np.maximum(0, curve.required_hc - curve.scheduled_now).sum() * keep_h)
+            after = float(np.maximum(0, curve.required_hc - curve.with_ot_plan).sum() * keep_h)
+            m = st.columns(4)
+            m[0].metric("Short HC-hours now", f"{before:.1f}")
+            m[1].metric("After OT plan", f"{after:.1f}", f"{after - before:+.1f}", delta_color="inverse")
+            m[2].metric("OT hours suggested", f"{plan.hours.sum():.1f}" if len(plan) else "0")
+            m[3].metric("Agents", plan.agent_id.nunique() if len(plan) else 0)
+            lo = curve[(curve.required_hc > 0) | (curve.with_ot_plan > 0)]
+            if len(lo):
+                view = curve.iloc[max(lo.index[0] - 1, 0):lo.index[-1] + 2]
+                long = view.melt("interval", var_name="series", value_name="hc")
+                long["series"] = long.series.map({"required_hc": "Required", "scheduled_now": "Scheduled now",
+                                                  "with_ot_plan": "With OT plan"})
+                st.altair_chart(alt.Chart(long).mark_line(point=True, interpolate="step-after").encode(
+                    x=alt.X("interval:N", sort=INTERVALS, title=None, axis=alt.Axis(labelAngle=-60)),
+                    y=alt.Y("hc:Q", title="Headcount"),
+                    color=alt.Color("series:N", scale=alt.Scale(
+                        domain=["Required", "Scheduled now", "With OT plan"], range=["#e45756", "#9d9d9d", "#4c78a8"])),
+                    tooltip=["interval", "series", alt.Tooltip("hc:Q", format=".1f")]), width="stretch")
+            if plan.empty:
+                if before > 0:
+                    st.info("Nobody can take OT in the short intervals within the current rules. Try including other "
+                            "accounts, raising the weekly OT cap, or lowering the minimum efficiency in Settings.")
+                else:
+                    st.success("No short intervals — no OT needed for this day.")
+            else:
+                plan_ed = plan.copy()
+                plan_ed.insert(0, "use", True)
+                ed = st.data_editor(plan_ed, hide_index=True, width="stretch", key=f"otp_ed_{hash(key)}",
+                                    disabled=[c for c in plan_ed.columns if c != "use"], column_config={
+                                        "agent_id": None, "use": st.column_config.CheckboxColumn("Use", width="small"),
+                                        "shift_date": st.column_config.TextColumn(
+                                            "Shift date", help="OT is logged on the date the extended shift started"),
+                                        "fills_short_hrs": st.column_config.NumberColumn(
+                                            "Fills (HC-hrs)", help="Short HC-hours this block covers"),
+                                        "week_ot_after": st.column_config.NumberColumn("Week OT after (h)")})
+                st.download_button("⬇️ OT plan (CSV)", plan.drop(columns="agent_id").to_csv(index=False),
+                                   f"ot_plan_{account}_{day}.csv")
+                b = st.columns(2)
+                act = None
+                if b[0].button("✅ Approve selected OT", type="primary"):
+                    act = "Approved"
+                if b[1].button("📨 Save as Pending (confirm with agents first)"):
+                    act = "Pending"
+                if act:
+                    n = 0
+                    for r in ed[ed.use].itertuples():
+                        ex("INSERT INTO ot_requests(agent_id,date,ot_type,start_time,end_time,hours,reason,status,"
+                           "filed_on,for_account) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                           (r.agent_id, r.shift_date, r.ot_type, r.start, r.end, r.hours,
+                            f"OT plan: short intervals on {day} ({account})", act, str(dt.date.today()), account))
+                        if act == "Approved" and r.ot_type == "Rest Day OT":
+                            ex("INSERT OR IGNORE INTO schedule_overrides VALUES(?,?,?,?,?,?)",
+                               (r.agent_id, r.shift_date, "Work (RD OT)", r.start, r.end, "OT plan"))
+                        n += 1
+                    st.session_state.pop("ot_plan", None)
+                    st.success(f"{n} OT block(s) saved as {act}." + (" Approve them later under Overtime → "
+                                                                     "Approvals." if act == "Pending" else ""))
+                    rerun()
 
     with t2:
         w0 = week_start(day)
@@ -1584,7 +1871,7 @@ def page_interval(acct):
             totals.append({"day": col, "forecast_volume": round(pdf.forecast_volume.sum()),
                            "peak_required_hc": round(pdf.required_hc.max(), 1),
                            "understaffed_intervals": len(s),
-                           "hc_hours_short": round(max(0.0, -s.variance.sum()) * INTERVAL_MIN / 60, 1),
+                           "hc_hours_short": round(float(np.maximum(0, -pdf.variance).sum()) * INTERVAL_MIN / 60, 1),
                            "history_weeks_used": len(used_d)})
         heat = pd.DataFrame(grid).dropna(how="all")
         st.caption("HC variance per interval (scheduled − required). Red = short, green = over. "
@@ -1660,7 +1947,7 @@ PAGES = {
     "⏱️ Attendance": page_attendance,
     "📶 Interval Planner": page_interval,
     "🗓️ Schedules": page_schedule,
-    "🌴 Leaves": page_leaves,
+    "🌴 Time Off": page_leaves,
     "🧩 Coverage Finder": page_coverage,
     "⏰ Overtime": page_ot,
     "📈 Reports": page_reports,

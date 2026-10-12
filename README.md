@@ -9,11 +9,11 @@ If Google isn't set up, the app falls back to a local file, `wfm.db`, which is h
 
 | Page | Use it for |
 |---|---|
-| **Dashboard** | Today's staffing per account: required vs scheduled vs present, lates, absences/NCNS, leaves, coverage brought in, headcount variance, open gaps, 14-day trend |
+| **Dashboard** | Today's staffing per account: **required HC calculated from volume**, scheduled vs present, lates, absences/NCNS, time off, coverage and OT hours, headcount variance, short intervals, open gaps, 14-day trend |
 | **Attendance** | Daily log sheet. Type time in/out (24h HH:MM); late, undertime and rendered OT are computed automatically. Handles graveyard/overnight shifts (e.g. 22:00–07:00). |
-| **Interval Planner** | 30-minute volume forecast, required HC (Erlang C for voice/chat, workload for email/back office), scheduled HC and **HC variance per interval**, projected service level, forecast vs actual, and a weekly variance heatmap |
-| **Schedules** | Weekly roster grid (color-coded rest days, leaves, RD OT, training). Change shifts for one or many agents, set training/holiday, do shift/RD swaps. |
-| **Leaves** | File leave (counts working days only), leave-cap warning per account, approve/deny, leave calendar, VL/SL balances |
+| **Interval Planner** | 30-minute volume forecast, required HC (Erlang C for voice/chat, workload for email/back office), scheduled HC and **HC variance per interval**, projected service level, forecast vs actual, a weekly variance heatmap, and the **🧮 OT plan**: who should do OT and when to fill the short intervals |
+| **Schedules** | Weekly roster grid of everyone's permanent schedule (color-coded rest days, time off, RD OT, training). One-off exceptions like training, holidays or swaps can be set here; day-to-day staffing is adjusted with OT. |
+| **Time Off** | File time off (counts working days only), cap warning when too many people on one account are off the same day, approve/deny, calendar, days-off summary per contractor. No leave credits — built for independent contractors. |
 | **Coverage Finder** | Pick a leave or absence → ranked list of who can cover, with the reason anyone is excluded. One click assigns the cover and logs approved OT. |
 | **Overtime** | File and approve OT, weekly OT vs cap, and **unapproved OT** (rendered past shift end without an approved request) to check before payroll |
 | **Reports** | Per-agent summary for any date range: attendance %, tardiness %, late minutes, absences, NCNS, undertime, rendered vs approved OT, leave days. CSV export. |
@@ -24,7 +24,7 @@ If Google isn't set up, the app falls back to a local file, `wfm.db`, which is h
 
 For the window you need covered, every active agent is checked against:
 
-- not on approved leave that day
+- not on approved time off that day
 - not already scheduled in an overlapping shift (checks the day before and after too, so graveyard shifts are handled)
 - at least **min rest hours** (default 8h) between their own shift and the cover window — unless it's back-to-back, which counts as a **shift extension** (pre/post-shift OT), capped at **max hours per stretch** (default 13h)
 - weekly approved OT stays under the **weekly OT cap** (default 12h)
@@ -45,6 +45,18 @@ Cover types: **Rest Day OT**, **Pre/Post-shift OT**, or **Same-day OT (separate 
 **3. Scheduled HC per interval.** Everyone on shift for that account in that half hour: default shifts and schedule changes, minus approved leaves and Absent/NCNS, plus approved OT and coverage. Coverage OT counts toward the account being covered. Partial intervals count partially (a 22:15 start counts as 0.5 in the 22:00 interval). Training and holidays are not counted.
 
 **4. Variance = Scheduled HC − Required HC.** Negative (red) = understaffed, positive (green) = overstaffed. **Projected SL** is the service level you'd get if the scheduled agents (after shrinkage) work the forecast.
+
+**5. Daily required HC (Dashboard).** Total interval need ÷ shift length (default 9h incl. lunch, in Settings). Example: if the 48 intervals add up to 76.5 HC-hours of need, required = 76.5 ÷ 9 = 8.5 → **9 people**. Accounts with no volume history yet fall back to the manual number in Accounts.
+
+### OT plan: filling short intervals without changing schedules
+
+Everyone keeps their permanent schedule. **Interval Planner → 🧮 OT plan → Build OT plan** looks at the short intervals and suggests the OT blocks that fill the most shortage for the fewest OT hours:
+
+- **Pre-shift OT** (come in early), **post-shift OT** (stay late, including after a graveyard shift), or **rest-day OT**.
+- It only suggests what the rules allow: no overlap with shifts, **min rest** between work stretches (default 8h), **max hours straight** including OT (default 13h), **weekly OT cap** (default 12h), block length limits (default 1–4h pre/post, up to 9h rest-day OT per person per day), and at least **60%** of each block must fall in short intervals so OT isn't wasted on already-covered time.
+- People without time off or absences that day only. It prefers the account's own agents and spreads OT to those with less OT this week. Tick **Also use agents from other accounts (same LOB)** or filter by skill if needed.
+- Review the list, untick anything you don't want, then **Approve selected OT**, or **Save as Pending** if you need to confirm with agents first (approve later under **Overtime → Approvals & log**). Approved OT immediately shows in the interval view, the dashboard and the attendance sheet (rest-day OT agents appear on the log for that day).
+- All limits are adjustable under **Settings → OT plan rules**.
 
 **Account settings** (Roster & Accounts → Accounts): Channel, SL target %, SL seconds, Chats at once, Shrinkage %, Max occupancy %. Blank values use these defaults:
 
@@ -98,7 +110,7 @@ The app logs in to Google as a **service account**: a robot Google user that onl
 2. Click **Share**, paste the service account's `client_email`, give it **Editor**, untick "Notify people", Share.
 3. Copy the sheet's URL.
 
-The app creates all the tabs it needs on first run: `accounts`, `agents`, `schedule_overrides`, `attendance`, `leaves`, `ot_requests`, `settings`.
+The app creates all the tabs it needs on first run: `accounts`, `agents`, `schedule_overrides`, `attendance`, `leaves`, `ot_requests`, `settings`, `interval_volume`.
 
 **C. Give the app the key**
 
@@ -145,16 +157,16 @@ Because the data lives in Google Sheets, nothing is lost when the free app sleep
 
 ## Getting your real data in
 
-1. **Roster & Accounts → Accounts**: add each account with LOB, required daily headcount, and max % allowed on leave the same day.
+1. **Roster & Accounts → Accounts**: add each account with LOB, channel (Voice / Chat / Email), service level target and shrinkage, and max % allowed off the same day.
 2. **Roster & Accounts → Import CSV**: download the template, fill it from your HR roster, upload.
    Rest days use `Mon,Tue,Wed,Thu,Fri,Sat,Sun` (comma-separated). Shift times are 24-hour `HH:MM`.
-3. Set leave credits (VL/SL) per agent in the Agents grid.
+3. **Interval Planner → Volume data**: upload 6–8 weeks of interval volume per account so required HC can be calculated.
 
 ## Daily routine for the scheduler
 
 1. Start of shift — **Dashboard**: check open gaps and headcount variance.
-2. **Interval Planner**: find the red intervals, then use **Coverage Finder** with a partial window (e.g. 01:00–04:00) to add OT exactly where it's needed. Use the week heatmap when building next week's schedule.
-3. **Coverage Finder**: fill each leave/absence gap.
+2. **Interval Planner → 🧮 OT plan**: build the OT plan for today (and tomorrow), approve it or send it to agents to confirm. The week heatmap shows which days will need the most OT.
+3. **Coverage Finder**: fill a specific person's full shift when they're off or absent.
 4. During/after shift — **Attendance**: enter time logs (or "Mark blanks as Present", then fix exceptions), Save.
-5. **Leaves / Overtime**: approve pending requests.
+5. **Time Off / Overtime**: approve pending requests.
 6. Weekly/cut-off — **Reports**: export for payroll and coaching.
