@@ -14,6 +14,7 @@ Run:  streamlit run app.py
 """
 import datetime as dt
 import hashlib
+import math
 import os
 import random
 import re
@@ -23,6 +24,8 @@ import threading
 import time
 from contextlib import closing
 
+import altair as alt
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -44,7 +47,8 @@ if USE_SHEETS:
                            f"wfm_cache_{hashlib.md5(_sid.encode()).hexdigest()[:10]}.db")
 else:
     DB_PATH = os.environ.get("WFM_DB", "wfm.db")
-TABLES = ["accounts", "agents", "schedule_overrides", "attendance", "leaves", "ot_requests", "settings"]
+TABLES = ["accounts", "agents", "schedule_overrides", "attendance", "leaves", "ot_requests", "settings",
+          "interval_volume"]
 _WRITE_RE = re.compile(r"^\s*(?:INSERT(?:\s+OR\s+\w+)?\s+INTO|UPDATE|DELETE\s+FROM)\s+(\w+)", re.I)
 DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 ONE_DAY = dt.timedelta(days=1)
@@ -67,7 +71,17 @@ DEFAULT_SETTINGS = {
     "max_daily_hrs": "13",     # max shift + OT hours in one stretch (incl. break)
     "max_weekly_ot_hrs": "12", # weekly OT cap per agent
     "ot_block_min": "30",      # rendered OT counted in blocks of N minutes
+    "forecast_weeks": "6",     # same-weekday history used for the interval forecast
+    "site_tz": "Asia/Manila",  # timezone schedules are written in
 }
+CHANNELS = ["Voice", "Chat", "Email / Back Office"]
+INTERVAL_MIN = 30
+INTERVALS = [f"{h:02d}:{m:02d}" for h in range(24) for m in range(0, 60, INTERVAL_MIN)]
+# per-channel defaults: SL %, SL seconds, concurrency, shrinkage %, max occupancy %
+CHANNEL_DEFAULTS = {"Voice": (80, 20, 1, 30, 85), "Chat": (80, 60, 2, 30, 85),
+                    "Email / Back Office": (90, 86400, 1, 30, 90)}
+ACCOUNT_EXTRA_COLS = {"channel": "TEXT", "sl_target_pct": "REAL", "sl_seconds": "REAL", "concurrency": "REAL",
+                      "shrinkage_pct": "REAL", "max_occupancy_pct": "REAL"}
 
 st.set_page_config(page_title="WFM Scheduler", page_icon="🗓️", layout="wide")
 
@@ -75,7 +89,12 @@ st.set_page_config(page_title="WFM Scheduler", page_icon="🗓️", layout="wide
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS accounts(
   name TEXT PRIMARY KEY, lob TEXT NOT NULL DEFAULT 'Voice',
-  required_hc INTEGER DEFAULT 0, max_leave_pct REAL DEFAULT 10);
+  required_hc INTEGER DEFAULT 0, max_leave_pct REAL DEFAULT 10,
+  channel TEXT, sl_target_pct REAL, sl_seconds REAL, concurrency REAL,
+  shrinkage_pct REAL, max_occupancy_pct REAL);
+CREATE TABLE IF NOT EXISTS interval_volume(
+  account TEXT, date TEXT, interval TEXT, volume REAL, aht REAL,
+  PRIMARY KEY(account, date, interval));
 CREATE TABLE IF NOT EXISTS agents(
   id INTEGER PRIMARY KEY AUTOINCREMENT, emp_id TEXT UNIQUE NOT NULL, name TEXT NOT NULL,
   account TEXT, lob TEXT, team_lead TEXT, skills TEXT DEFAULT '',
@@ -119,6 +138,18 @@ def ex(sql, params=()):
     if STORE is not None and m and changed:
         STORE.mark_dirty(m.group(1))
     return rowid
+
+
+def exmany(sql, rows):
+    """Bulk version of ex() for imports."""
+    rows = [[_py(v) for v in r] for r in rows]
+    if not rows:
+        return
+    with closing(_conn()) as c, c:
+        c.executemany(sql, rows)
+    m = _WRITE_RE.match(sql)
+    if STORE is not None and m:
+        STORE.mark_dirty(m.group(1))
 
 
 def _py(v):
@@ -234,6 +265,10 @@ class SheetStore:
 def init_db():
     with closing(_conn()) as c, c:
         c.executescript(SCHEMA)
+        have = {r[1] for r in c.execute("PRAGMA table_info(accounts)")}
+        for col, typ in ACCOUNT_EXTRA_COLS.items():  # upgrade databases made by older versions
+            if col not in have:
+                c.execute(f"ALTER TABLE accounts ADD COLUMN {col} {typ}")
 
 
 def ensure_default_settings():
@@ -267,9 +302,28 @@ def rerun():
     st.rerun()
 
 
-def setting(key):
+def upsert_account(r):
+    """Insert/update an account, filling blank interval settings with channel defaults."""
+    def val(k, default):
+        v = r.get(k)
+        return default if v is None or (isinstance(v, float) and pd.isna(v)) or v == "" else v
+    lob = val("lob", "Voice")
+    channel = val("channel", "Voice" if lob == "Voice" else "Chat")
+    sl, sls, conc, shr, occ = CHANNEL_DEFAULTS.get(channel, CHANNEL_DEFAULTS["Voice"])
+    ex("INSERT OR REPLACE INTO accounts(name,lob,required_hc,max_leave_pct,channel,sl_target_pct,sl_seconds,"
+       "concurrency,shrinkage_pct,max_occupancy_pct) VALUES(?,?,?,?,?,?,?,?,?,?)",
+       (r["name"], lob, val("required_hc", 0), val("max_leave_pct", 10), channel, val("sl_target_pct", sl),
+        val("sl_seconds", sls), val("concurrency", conc), val("shrinkage_pct", shr), val("max_occupancy_pct", occ)))
+
+
+def setting_str(key):
     df = q("SELECT value FROM settings WHERE key=?", (key,))
-    return float(df.value[0]) if len(df) else float(DEFAULT_SETTINGS[key])
+    v = str(df.value[0]).strip() if len(df) and df.value[0] is not None else ""
+    return v or DEFAULT_SETTINGS[key]
+
+
+def setting(key):
+    return float(setting_str(key))
 
 
 STORE = None
@@ -1048,15 +1102,27 @@ def page_roster():
                 st.success("Roster saved." + (f" {len(removed)} removed row(s) set inactive." if removed else ""))
     with t2:
         acc = q("SELECT * FROM accounts ORDER BY name")
-        st.caption("**required_hc** = agents needed on the floor per day · **max_leave_pct** = % of headcount "
-                   "allowed on leave the same day.")
-        ed = st.data_editor(acc, num_rows="dynamic", hide_index=True, key="acc_ed",
-                            column_config={"lob": st.column_config.SelectboxColumn("LOB", options=LOBS)})
+        st.caption("**Required HC** = agents needed on the floor per day (daily dashboard) · **Max leave %** = share of "
+                   "headcount allowed on leave the same day. The interval columns drive the **Interval Planner**: "
+                   "leave them blank to use sensible defaults for the channel.")
+        ed = st.data_editor(acc, num_rows="dynamic", hide_index=True, key="acc_ed", column_config={
+            "name": st.column_config.TextColumn("Account", required=True),
+            "lob": st.column_config.SelectboxColumn("LOB", options=LOBS),
+            "required_hc": st.column_config.NumberColumn("Required HC/day"),
+            "max_leave_pct": st.column_config.NumberColumn("Max leave %"),
+            "channel": st.column_config.SelectboxColumn("Channel", options=CHANNELS,
+                                                        help="Voice & Chat use Erlang C; Email/Back Office uses workload"),
+            "sl_target_pct": st.column_config.NumberColumn("SL target %", help="e.g. 80 for 80/20"),
+            "sl_seconds": st.column_config.NumberColumn("SL seconds", help="e.g. 20 for 80/20 voice, 60 for chat"),
+            "concurrency": st.column_config.NumberColumn("Chats at once", help="Chat only; 1 for voice/email"),
+            "shrinkage_pct": st.column_config.NumberColumn("Shrinkage %", help="Breaks, lunch, coaching, meetings, "
+                                                           "system downtime — time on shift but not taking contacts"),
+            "max_occupancy_pct": st.column_config.NumberColumn("Max occupancy %"),
+        })
         if st.button("💾 Save accounts"):
-            for r in ed.itertuples():
-                if r.name:
-                    ex("INSERT OR REPLACE INTO accounts VALUES(?,?,?,?)",
-                       (r.name, r.lob or "Voice", r.required_hc or 0, r.max_leave_pct or 10))
+            for r in ed.to_dict("records"):
+                if r.get("name"):
+                    upsert_account(r)
             for n in set(acc.name) - set(ed.name.dropna()):
                 ex("DELETE FROM accounts WHERE name=?", (n,))
             st.success("Accounts saved.")
@@ -1087,10 +1153,11 @@ def page_roster():
 
 def load_sample_data():
     rnd = random.Random(7)
-    accounts = [("Telco Inbound", "Voice", 8, 15), ("E-commerce Chat", "Non-Voice", 5, 20),
-                ("Email & Back Office", "Non-Voice", 3, 25)]
-    for a in accounts:
-        ex("INSERT OR REPLACE INTO accounts VALUES(?,?,?,?)", a)
+    accounts = [("Telco Inbound", "Voice", 8, 15, "Voice"), ("E-commerce Chat", "Non-Voice", 5, 20, "Chat"),
+                ("Email & Back Office", "Non-Voice", 3, 25, "Email / Back Office")]
+    for name, lob, hc, pct, ch in accounts:
+        upsert_account(dict(name=name, lob=lob, required_hc=hc, max_leave_pct=pct, channel=ch))
+    sample_interval_volume(rnd)
     first = ["Juan", "Maria", "Jose", "Ana", "Mark", "Kristine", "John Paul", "Angelica", "Carlo", "Jasmine",
              "Paolo", "Rica", "Miguel", "Joy", "Rafael", "Bea", "Kevin", "Trisha", "Ramon", "Liza", "Nico", "Carla"]
     last = ["Dela Cruz", "Santos", "Reyes", "Garcia", "Mendoza", "Bautista", "Villanueva", "Ramos", "Aquino",
@@ -1146,6 +1213,7 @@ def load_sample_data():
 def page_settings():
     st.header("⚙️ Settings")
     with st.form("settings"):
+        st.markdown("**Attendance & coverage rules**")
         c = st.columns(5)
         vals = {}
         labels = {"grace_min": "Grace period (min)", "min_rest_hrs": "Min rest between shifts (h)",
@@ -1153,6 +1221,13 @@ def page_settings():
                   "ot_block_min": "OT block (min)"}
         for i, (k, lbl) in enumerate(labels.items()):
             vals[k] = c[i].number_input(lbl, value=setting(k), step=1.0)
+        st.markdown("**Interval planner**")
+        c = st.columns([1, 2, 2])
+        vals["forecast_weeks"] = c[0].number_input("Forecast history (weeks)", 1.0, 26.0, setting("forecast_weeks"),
+                                                   step=1.0, help="Same-weekday history used for the forecast")
+        tz_now = setting_str("site_tz")
+        vals["site_tz"] = c[1].selectbox("Site timezone (your schedules)", COMMON_TZ,
+                                         index=COMMON_TZ.index(tz_now) if tz_now in COMMON_TZ else 0)
         if st.form_submit_button("Save settings"):
             for k, v in vals.items():
                 ex("INSERT OR REPLACE INTO settings VALUES(?,?)", (k, str(v)))
@@ -1185,15 +1260,405 @@ def page_settings():
         st.success("Sample data loaded — check the Dashboard.")
     with st.expander("Danger zone"):
         if st.checkbox("I understand this deletes everything") and st.button("Wipe all data"):
-            for t in ("attendance", "leaves", "ot_requests", "schedule_overrides", "agents", "accounts"):
+            for t in ("attendance", "leaves", "ot_requests", "schedule_overrides", "agents", "accounts", "interval_volume"):
                 ex(f"DELETE FROM {t}")
             st.success("All data deleted.")
+
+
+# ----------------------------------------------------------------- interval planner
+COMMON_TZ = ["Asia/Manila", "America/New_York", "America/Chicago", "America/Denver", "America/Phoenix",
+             "America/Los_Angeles", "America/Anchorage", "Pacific/Honolulu", "America/Toronto", "Europe/London",
+             "Europe/Berlin", "Australia/Sydney", "Asia/Singapore", "Asia/Kolkata", "UTC"]
+INTERVAL_SEC = INTERVAL_MIN * 60
+
+
+def account_params(account):
+    df = q("SELECT * FROM accounts WHERE name=?", (account,))
+    r = df.iloc[0].to_dict() if len(df) else {"lob": "Voice"}
+    ch = r.get("channel") if isinstance(r.get("channel"), str) and r.get("channel") in CHANNELS else \
+        ("Voice" if r.get("lob") == "Voice" else "Chat")
+    d = CHANNEL_DEFAULTS[ch]
+
+    def g(k, i):
+        v = r.get(k)
+        return float(d[i]) if v is None or (isinstance(v, float) and pd.isna(v)) or v == "" else float(v)
+    return dict(channel=ch, sl_pct=min(max(g("sl_target_pct", 0), 1), 99.9), sl_sec=max(g("sl_seconds", 1), 1),
+                conc=max(g("concurrency", 2), 1), shrink=min(max(g("shrinkage_pct", 3), 0), 90),
+                max_occ=min(max(g("max_occupancy_pct", 4), 10), 100))
+
+
+def _traffic(volume, aht, p):
+    eff_aht = aht / (p["conc"] if p["channel"] == "Chat" else 1)
+    return volume * eff_aht / INTERVAL_SEC, eff_aht
+
+
+def erlang_requirement(volume, aht, p):
+    """Agents needed taking contacts in the interval (before shrinkage)."""
+    if volume <= 0 or aht <= 0:
+        return 0.0
+    if p["channel"] == "Email / Back Office":  # deferred work: workload ÷ occupancy
+        return volume * aht / INTERVAL_SEC / (p["max_occ"] / 100)
+    a, eff_aht = _traffic(volume, aht, p)
+    target, occ = p["sl_pct"] / 100, p["max_occ"] / 100
+    b, n = 1.0, 0
+    for n in range(1, int(a * 3) + 100):
+        b = a * b / (n + a * b)  # Erlang B recursion (numerically stable)
+        if n <= a:
+            continue
+        c = n * b / (n - a * (1 - b))  # Erlang C: probability a contact waits
+        sl = 1 - c * math.exp(-(n - a) * p["sl_sec"] / eff_aht)
+        if sl >= target and a / n <= occ:
+            return float(n)
+    return float(n)
+
+
+def erlang_sl(volume, aht, agents, p):
+    """Projected service level if `agents` are taking contacts."""
+    if volume <= 0 or aht <= 0 or p["channel"] == "Email / Back Office":
+        return None
+    a, eff_aht = _traffic(volume, aht, p)
+    n = int(math.floor(agents + 1e-9))
+    if n <= a:
+        return 0.0
+    b = 1.0
+    for k in range(1, n + 1):
+        b = a * b / (k + a * b)
+    c = n * b / (n - a * (1 - b))
+    return max(0.0, 1 - c * math.exp(-(n - a) * p["sl_sec"] / eff_aht))
+
+
+def forecast_day(account, day, weeks=None, adj_pct=0.0):
+    """Weighted same-weekday average of the last `weeks` weeks (newest counts most)."""
+    weeks = int(weeks or setting("forecast_weeks"))
+    out = pd.DataFrame({"interval": INTERVALS, "volume": 0.0, "aht": 0.0})
+    hist = q("SELECT date, interval, volume, aht FROM interval_volume WHERE account=? AND date>=? AND date<?",
+             (account, str(day - dt.timedelta(days=7 * weeks)), str(day)))
+    if hist.empty:
+        return out, []
+    hist = hist[pd.to_datetime(hist.date).dt.weekday == day.weekday()].copy()
+    dates = sorted(hist.date.unique(), reverse=True)[:weeks]
+    if not dates:
+        return out, []
+    hist["volume"] = pd.to_numeric(hist.volume, errors="coerce").fillna(0)
+    hist["aht"] = pd.to_numeric(hist.aht, errors="coerce").fillna(0)
+    hist["work"] = hist.volume * hist.aht
+    w = pd.Series({d: float(len(dates) - i) for i, d in enumerate(dates)})
+    grid = lambda col: hist.pivot_table(index="interval", columns="date", values=col, aggfunc="sum") \
+        .reindex(index=INTERVALS, columns=dates).fillna(0)
+    vol, work = grid("volume"), grid("work")
+    wv, ww = vol.mul(w, axis=1).sum(axis=1), work.mul(w, axis=1).sum(axis=1)
+    overall_aht = ww.sum() / wv.sum() if wv.sum() else 0.0
+    out["volume"] = (wv / w.sum() * (1 + adj_pct / 100)).values
+    out["aht"] = (ww / wv.replace(0, np.nan)).fillna(overall_aht).values
+    return out, dates
+
+
+def scheduled_by_interval(account, day):
+    """Bodies on shift per interval: scheduled shifts − leaves − absences + approved OT/coverage."""
+    sch = build_schedule(day - ONE_DAY, day)
+    att = q("SELECT agent_id, date, status FROM attendance WHERE date BETWEEN ? AND ?",
+            (str(day - ONE_DAY), str(day)))
+    absent = {(int(a), d) for a, d, s in zip(att.agent_id, att.date, att.status) if s in ABSENT_STATUS}
+    ot = q("SELECT o.agent_id, o.date, o.start_time, o.end_time, a.account AS own, c.account AS cov "
+           "FROM ot_requests o JOIN agents a ON a.id=o.agent_id LEFT JOIN agents c ON c.id=o.covering_for "
+           "WHERE o.status='Approved' AND o.date BETWEEN ? AND ?", (str(day - ONE_DAY), str(day)))
+    ot_keys = {(int(a), d) for a, d in zip(ot.agent_id, ot.date)}
+    own_shift, windows = {}, []
+    for r in sch.itertuples():
+        if r.kind in ("Work", "Work (RD OT)"):
+            own_shift[(r.agent_id, r.date)] = shift_window(dt.date.fromisoformat(r.date), r.shift_start, r.shift_end)
+        if r.account != account or (r.agent_id, r.date) in absent:
+            continue
+        if r.kind == "Work" or (r.kind == "Work (RD OT)" and (r.agent_id, r.date) not in ot_keys):
+            windows.append(own_shift[(r.agent_id, r.date)])
+    for r in ot.itertuples():
+        target = r.cov if isinstance(r.cov, str) and r.cov else r.own
+        if target != account or not r.start_time or not r.end_time:
+            continue
+        d = dt.date.fromisoformat(r.date)
+        cands = [shift_window(d + dt.timedelta(days=k), r.start_time, r.end_time) for k in (0, 1)]
+        base_shift = own_shift.get((int(r.agent_id), r.date))
+        if base_shift and base_shift[0] is not None:  # post-shift OT after a graveyard shift lands the next day
+            s0, e0 = base_shift
+            cands.sort(key=lambda w: max((w[0] - e0).total_seconds(), (s0 - w[1]).total_seconds(), 0))
+        windows.append(cands[0])
+    t0 = dt.datetime.combine(day, dt.time())
+    step = dt.timedelta(minutes=INTERVAL_MIN)
+    out = []
+    for i in range(len(INTERVALS)):
+        a, b = t0 + i * step, t0 + (i + 1) * step
+        out.append(sum(max(0.0, (min(e, b) - max(s, a)).total_seconds()) for s, e in windows if s) / INTERVAL_SEC)
+    return np.array(out)
+
+
+def interval_plan(account, day, adj_pct=0.0, weeks=None):
+    p = account_params(account)
+    fc, used = forecast_day(account, day, weeks, adj_pct)
+    sched = scheduled_by_interval(account, day)
+    keep = 1 - p["shrink"] / 100
+    net = [erlang_requirement(v, a, p) for v, a in zip(fc.volume, fc.aht)]
+    df = fc.rename(columns={"volume": "forecast_volume", "aht": "forecast_aht"})
+    df["required_on_queue"] = net
+    df["required_hc"] = [n / keep if n else 0.0 for n in net]
+    df["scheduled_hc"] = sched
+    df["variance"] = df.scheduled_hc - df.required_hc
+    df["projected_sl"] = [erlang_sl(v, a, s * keep, p) for v, a, s in zip(fc.volume, fc.aht, sched)]
+    act = q("SELECT interval, volume FROM interval_volume WHERE account=? AND date=?", (account, str(day)))
+    df["actual_volume"] = df.interval.map(dict(zip(act.interval, pd.to_numeric(act.volume, errors="coerce"))))
+    return df, used, p
+
+
+def normalize_volume(df, source_tz, site_tz, default_aht):
+    """Map an ACD/chat export to (date, interval, volume, aht) in site time, 30-min buckets."""
+    cols = {c.lower().strip().replace(" ", "_"): c for c in df.columns}
+    pick = lambda *names: next((cols[n] for n in names if n in cols), None)
+    c_date = pick("date", "day", "report_date")
+    c_int = pick("interval", "interval_start", "time", "start_time", "half_hour")
+    c_dt = pick("datetime", "timestamp", "interval_datetime", "date_time")
+    c_vol = pick("volume", "offered", "calls_offered", "contacts", "calls", "chats", "emails", "received")
+    c_aht = pick("aht", "aht_seconds", "aht_sec", "handle_time", "avg_handle_time")
+    if c_vol is None or not (c_dt or (c_date and c_int)):
+        raise ValueError("Need a `volume` column and either `date` + `interval` columns or a `datetime` column.")
+    raw = df[c_dt].astype(str) if c_dt else df[c_date].astype(str) + " " + df[c_int].astype(str)
+    ts = pd.to_datetime(raw, errors="coerce", format="mixed")
+    if source_tz != site_tz:
+        ts = ts.dt.tz_localize(source_tz, ambiguous="NaT", nonexistent="shift_forward") \
+            .dt.tz_convert(site_tz).dt.tz_localize(None)
+    vol = pd.to_numeric(df[c_vol], errors="coerce").fillna(0)
+    aht = pd.to_numeric(df[c_aht], errors="coerce").fillna(default_aht) if c_aht else pd.Series(default_aht,
+                                                                                               index=df.index)
+    work = pd.DataFrame({"ts": ts.dt.floor(f"{INTERVAL_MIN}min"), "volume": vol, "work": vol * aht})
+    skipped = int(work.ts.isna().sum())
+    g = work.dropna(subset=["ts"]).groupby("ts", as_index=False).sum()
+    g["aht"] = np.where(g.volume > 0, g.work / g.volume.replace(0, np.nan), default_aht)
+    g["date"] = g.ts.dt.strftime("%Y-%m-%d")
+    g["interval"] = g.ts.dt.strftime("%H:%M")
+    return g[["date", "interval", "volume", "aht"]].round({"aht": 1}), skipped
+
+
+def sample_interval_volume(rnd):
+    """8 weeks of realistic-looking history in site time for the demo accounts."""
+    today = dt.date.today()
+    profiles = {  # (peak hour in site time, spread h, contacts at peak per 30 min)
+        "Telco Inbound": dict(peaks=[(26.5, 2.6, 15)], base=0.0, aht=330, weekend=0.6),
+        "E-commerce Chat": dict(peaks=[(26.0, 2.4, 8), (11.5, 2.0, 6)], base=0.0, aht=540, weekend=1.0),
+        "Email & Back Office": dict(peaks=[(13.0, 2.5, 5)], base=0.0, aht=420, weekend=0.4),
+    }
+    rows = []
+    for acc, pr in profiles.items():
+        for k in range(56, 0, -1):
+            d = today - dt.timedelta(days=k)
+            mult = (pr["weekend"] if d.weekday() >= 5 else 1.0) * (1.08 if d.weekday() == 0 else 1.0)
+            mult *= (1 + 0.04 * rnd.gauss(0, 1)) * (1 + 0.004 * (56 - k))
+            for i, iv in enumerate(INTERVALS):
+                h = i * INTERVAL_MIN / 60 + INTERVAL_MIN / 120
+                lam = pr["base"] + sum(amp * math.exp(-0.5 * (min(abs(h - c), abs(h - c + 24), abs(h - c - 24)) / sd) ** 2)
+                                       for c, sd, amp in pr["peaks"])
+                lam *= mult
+                vol = max(0, round(rnd.gauss(lam, math.sqrt(lam))))
+                rows.append((acc, str(d), iv, vol, round(pr["aht"] * (1 + 0.08 * rnd.gauss(0, 1)))))
+    exmany("INSERT OR REPLACE INTO interval_volume VALUES(?,?,?,?,?)", rows)
+
+
+def _variance_color(v):
+    if not isinstance(v, (int, float)) or pd.isna(v):
+        return ""
+    if v <= -2:
+        return "background-color:#f1948a;color:#000"
+    if v < -0.5:
+        return "background-color:#fadbd8;color:#000"
+    if v >= 2:
+        return "background-color:#abebc6;color:#000"
+    if v > 0.5:
+        return "background-color:#e9f7ef;color:#000"
+    return ""
+
+
+def page_interval(acct):
+    st.header("📶 Interval Planner")
+    accts = account_names()
+    if not accts:
+        st.info("Add accounts under **Roster & Accounts** first, or load sample data in **Settings**.")
+        return
+    c = st.columns([2, 1.2, 1, 1])
+    account = c[0].selectbox("Account", accts, index=accts.index(acct) if acct in accts else 0, key="iv_acc")
+    day = c[1].date_input("Date", dt.date.today(), key="iv_day")
+    adj = c[2].number_input("Volume adj. %", -90.0, 500.0, 0.0, step=5.0,
+                            help="Lift or cut the forecast, e.g. +15 for a promo, billing cycle or outage")
+    weeks = c[3].number_input("History (weeks)", 1, 26, int(setting("forecast_weeks")), key="iv_weeks")
+    p = account_params(account)
+    rule = (f"{p['sl_pct']:g}% answered in {p['sl_sec']:g}s" if p["channel"] != "Email / Back Office"
+            else "workload ÷ occupancy")
+    st.caption(f"**{p['channel']}** · {rule}"
+               + (f" · {p['conc']:g} chats at once" if p["channel"] == "Chat" else "")
+               + f" · max occupancy {p['max_occ']:g}% · shrinkage {p['shrink']:g}% · times in "
+               f"{setting_str('site_tz')} · change these under Roster & Accounts → Accounts")
+    t1, t2, t3 = st.tabs(["Day view", "Week heatmap", "Volume data"])
+
+    with t1:
+        df, used, p = interval_plan(account, day, adj, weeks)
+        if not used:
+            st.warning(f"No volume history for {day:%A}s in the last {weeks} weeks — upload it in the "
+                       "**Volume data** tab. Showing scheduled headcount only.")
+        else:
+            st.caption(f"Forecast from {len(used)} {day:%A}(s): {', '.join(used)} (newest weighted most).")
+        active = df[(df.required_hc > 0) | (df.scheduled_hc > 0) | (df.actual_volume.fillna(0) > 0)]
+        short = df[df.variance < -0.5]
+        vol_tot = df.forecast_volume.sum()
+        sl_rows = df.dropna(subset=["projected_sl"])
+        day_sl = (sl_rows.projected_sl * sl_rows.forecast_volume).sum() / sl_rows.forecast_volume.sum() \
+            if len(sl_rows) and sl_rows.forecast_volume.sum() else None
+        m = st.columns(5)
+        m[0].metric("Forecast volume", f"{vol_tot:,.0f}")
+        if len(active):
+            pk = df.loc[df.required_hc.idxmax()]
+            m[1].metric("Peak required HC", f"{pk.required_hc:.1f}", f"at {pk.interval}", delta_color="off")
+            worst = df.loc[df.variance.idxmin()]
+            m[2].metric("Worst interval", f"{worst.variance:+.1f}", f"at {worst.interval}", delta_color="off")
+        m[3].metric("Understaffed intervals", len(short),
+                    f"{max(0.0, -short.variance.sum()) * INTERVAL_MIN / 60:.1f} HC-hours short", delta_color="off")
+        m[4].metric("Projected SL (day)", f"{day_sl:.0%}" if day_sl is not None else "—",
+                    f"target {p['sl_pct']:g}%" if day_sl is not None else None, delta_color="off")
+
+        if len(active):
+            lo, hi = INTERVALS.index(active.interval.iloc[0]), INTERVALS.index(active.interval.iloc[-1])
+            view = df.iloc[max(lo - 1, 0):hi + 2]
+            x = alt.X("interval:N", sort=INTERVALS, title=None, axis=alt.Axis(labelAngle=-60))
+            tip = ["interval", alt.Tooltip("scheduled_hc:Q", format=".1f"), alt.Tooltip("required_hc:Q", format=".1f"),
+                   alt.Tooltip("variance:Q", format="+.1f"), alt.Tooltip("forecast_volume:Q", format=".0f")]
+            bars = alt.Chart(view).mark_bar(opacity=0.55, color="#4c78a8").encode(
+                x=x, y=alt.Y("scheduled_hc:Q", title="Headcount"), tooltip=tip)
+            line = alt.Chart(view).mark_line(color="#e45756", point=True, strokeWidth=2).encode(
+                x=x, y="required_hc:Q", tooltip=tip)
+            st.markdown("**Scheduled (bars) vs required (red line)**")
+            st.altair_chart(bars + line, width="stretch")
+            var = alt.Chart(view).mark_bar().encode(
+                x=x, y=alt.Y("variance:Q", title="Variance (HC)"), tooltip=tip,
+                color=alt.condition("datum.variance < 0", alt.value("#e45756"), alt.value("#54a24b")))
+            st.markdown("**HC variance** (below zero = understaffed)")
+            st.altair_chart(var, width="stretch", height=220)
+            if view.actual_volume.notna().any():
+                vl = view.melt(id_vars="interval", value_vars=["forecast_volume", "actual_volume"],
+                               var_name="series", value_name="contacts").dropna()
+                st.markdown("**Forecast vs actual volume**")
+                st.altair_chart(alt.Chart(vl).mark_line(point=True).encode(
+                    x=x, y="contacts:Q", color="series:N", tooltip=["interval", "series", "contacts"]),
+                    width="stretch", height=220)
+                acc_rows = view.dropna(subset=["actual_volume"])
+                if acc_rows.actual_volume.sum():
+                    err = (acc_rows.forecast_volume - acc_rows.actual_volume).abs().sum() / acc_rows.actual_volume.sum()
+                    st.caption(f"Forecast accuracy this day: **{max(0, 1 - err):.0%}** (1 − weighted absolute error).")
+
+        show = (active if st.toggle("Hide empty intervals", True) else df).copy()
+        show["projected_sl"] = (show.projected_sl * 100).round(0)
+        table = show[["interval", "actual_volume", "forecast_volume", "forecast_aht", "required_on_queue",
+                      "required_hc", "scheduled_hc", "variance", "projected_sl"]].round(
+            {"forecast_volume": 1, "forecast_aht": 0, "required_on_queue": 1, "required_hc": 1,
+             "scheduled_hc": 1, "variance": 1})
+        styler = table.style.format(precision=1, na_rep="")
+        st.dataframe((styler.map if hasattr(styler, "map") else styler.applymap)(_variance_color, subset=["variance"]),
+                     hide_index=True, width="stretch", column_config={
+                         "actual_volume": "Actual vol", "forecast_volume": "Forecast vol", "forecast_aht": "AHT (s)",
+                         "required_on_queue": st.column_config.NumberColumn(
+                             "Req. on queue", help="Agents needed taking contacts (Erlang C / workload)"),
+                         "required_hc": st.column_config.NumberColumn("Req. HC", help="On-queue need ÷ (1 − shrinkage)"),
+                         "scheduled_hc": st.column_config.NumberColumn(
+                             "Sched. HC", help="On shift: schedule − leave − absences + approved OT/coverage"),
+                         "variance": "Variance", "projected_sl": st.column_config.NumberColumn(
+                             "Proj. SL %", help="Service level if scheduled HC (after shrinkage) works the forecast")})
+        st.download_button("⬇️ Download interval plan (CSV)", df.to_csv(index=False),
+                           f"interval_plan_{account}_{day}.csv")
+        st.caption("Short in some intervals? Use **Coverage Finder** with a partial window (e.g. 01:00–04:00) to "
+                   "add pre/post-shift OT exactly where it's needed.")
+
+    with t2:
+        w0 = week_start(day)
+        grid, totals = {}, []
+        for i in range(7):
+            d = w0 + dt.timedelta(days=i)
+            pdf, used_d, _ = interval_plan(account, d, adj, weeks)
+            col = f"{DAYS[i]} {d:%m-%d}"
+            grid[col] = pdf.set_index("interval").variance
+            grid[col][(pdf.required_hc.values == 0) & (pdf.scheduled_hc.values == 0)] = np.nan
+            s = pdf[pdf.variance < -0.5]
+            totals.append({"day": col, "forecast_volume": round(pdf.forecast_volume.sum()),
+                           "peak_required_hc": round(pdf.required_hc.max(), 1),
+                           "understaffed_intervals": len(s),
+                           "hc_hours_short": round(max(0.0, -s.variance.sum()) * INTERVAL_MIN / 60, 1),
+                           "history_weeks_used": len(used_d)})
+        heat = pd.DataFrame(grid).dropna(how="all")
+        st.caption("HC variance per interval (scheduled − required). Red = short, green = over. "
+                   "Blank = no demand and nobody scheduled.")
+        if heat.empty:
+            st.info("No demand or schedules this week yet.")
+        else:
+            hs = heat.style.format("{:+.1f}", na_rep="")
+            st.dataframe((hs.map if hasattr(hs, "map") else hs.applymap)(_variance_color), width="stretch",
+                         height=min(900, 38 + 35 * len(heat)))
+        st.dataframe(pd.DataFrame(totals), hide_index=True, width="stretch")
+
+    with t3:
+        cov = q("SELECT account, MIN(date) AS first_date, MAX(date) AS last_date, COUNT(DISTINCT date) AS days, "
+                "ROUND(SUM(volume)) AS total_volume FROM interval_volume GROUP BY account ORDER BY account")
+        st.markdown("**History loaded**")
+        st.dataframe(cov, hide_index=True, width="stretch") if len(cov) else st.caption("No volume history yet.")
+        st.markdown("**Upload interval volume** (CSV from your ACD, chat or ticketing platform)")
+        st.caption("Columns: `date`, `interval` (start time, e.g. 13:30 or 1:30 PM), `volume` (offered/received), "
+                   "and optionally `aht` in seconds and `account`. A single `datetime` column also works. "
+                   "15-minute data is combined into 30-minute intervals.")
+        tmpl = pd.DataFrame({"date": ["2026-10-05"] * 3, "interval": ["08:00", "08:30", "09:00"],
+                             "volume": [42, 55, 61], "aht": [355, 362, 348]})
+        st.download_button("Download template", tmpl.to_csv(index=False), "interval_volume_template.csv")
+        c = st.columns(3)
+        up_acc = c[0].selectbox("Account (if the file has no account column)", accts,
+                                index=accts.index(account), key="iv_up_acc")
+        src_tz = c[1].selectbox("Timezone of the times in the file", COMMON_TZ,
+                                index=COMMON_TZ.index("America/Chicago"), key="iv_src_tz",
+                                help="US client reports are usually in the client's time; daylight saving is handled")
+        def_aht = c[2].number_input("AHT (s) if not in file", 1.0, 36000.0, 360.0, key="iv_def_aht")
+        up = st.file_uploader("Volume CSV", type=["csv"], key="iv_file")
+        if up is not None:
+            try:
+                raw = pd.read_csv(up)
+                site_tz = setting_str("site_tz")
+                acc_col = next((c for c in raw.columns if c.lower().strip() == "account"), None)
+                parts = raw.groupby(raw[acc_col].astype(str)) if acc_col else [(up_acc, raw)]
+                frames, skipped = [], 0
+                for acc_name, part in parts:
+                    norm, sk = normalize_volume(part, src_tz, site_tz, def_aht)
+                    norm.insert(0, "account", acc_name)
+                    frames.append(norm)
+                    skipped += sk
+                ready = pd.concat(frames, ignore_index=True)
+                st.write(f"**{len(ready):,}** intervals ready ({ready.date.min()} → {ready.date.max()}, "
+                         f"{src_tz} → {site_tz})" + (f" · {skipped} rows skipped (unreadable time)" if skipped else ""))
+                unknown = sorted(set(ready.account) - set(accts))
+                if unknown:
+                    st.warning(f"Accounts not in your list (will be added as Voice): {', '.join(unknown)}")
+                st.dataframe(ready.head(20), hide_index=True)
+                if st.button("Import volume", type="primary"):
+                    for u in unknown:
+                        upsert_account({"name": u, "lob": "Voice"})
+                    exmany("INSERT OR REPLACE INTO interval_volume VALUES(?,?,?,?,?)",
+                           ready[["account", "date", "interval", "volume", "aht"]].values.tolist())
+                    st.success(f"Imported {len(ready):,} intervals.")
+                    rerun()
+            except Exception as e:
+                st.error(f"Couldn't read that file: {e}")
+        with st.expander("Delete volume history"):
+            c = st.columns(3)
+            d1 = c[0].date_input("From", dt.date.today() - dt.timedelta(days=7), key="iv_del1")
+            d2 = c[1].date_input("To", dt.date.today(), key="iv_del2")
+            if c[2].button(f"Delete {account} volume in range"):
+                ex("DELETE FROM interval_volume WHERE account=? AND date BETWEEN ? AND ?", (account, str(d1), str(d2)))
+                rerun()
 
 
 # ----------------------------------------------------------------- layout
 PAGES = {
     "📊 Dashboard": page_dashboard,
     "⏱️ Attendance": page_attendance,
+    "📶 Interval Planner": page_interval,
     "🗓️ Schedules": page_schedule,
     "🌴 Leaves": page_leaves,
     "🧩 Coverage Finder": page_coverage,

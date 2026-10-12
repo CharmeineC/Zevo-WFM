@@ -11,13 +11,14 @@ If Google isn't set up, the app falls back to a local file, `wfm.db`, which is h
 |---|---|
 | **Dashboard** | Today's staffing per account: required vs scheduled vs present, lates, absences/NCNS, leaves, coverage brought in, headcount variance, open gaps, 14-day trend |
 | **Attendance** | Daily log sheet. Type time in/out (24h HH:MM); late, undertime and rendered OT are computed automatically. Handles graveyard/overnight shifts (e.g. 22:00–07:00). |
+| **Interval Planner** | 30-minute volume forecast, required HC (Erlang C for voice/chat, workload for email/back office), scheduled HC and **HC variance per interval**, projected service level, forecast vs actual, and a weekly variance heatmap |
 | **Schedules** | Weekly roster grid (color-coded rest days, leaves, RD OT, training). Change shifts for one or many agents, set training/holiday, do shift/RD swaps. |
 | **Leaves** | File leave (counts working days only), leave-cap warning per account, approve/deny, leave calendar, VL/SL balances |
 | **Coverage Finder** | Pick a leave or absence → ranked list of who can cover, with the reason anyone is excluded. One click assigns the cover and logs approved OT. |
 | **Overtime** | File and approve OT, weekly OT vs cap, and **unapproved OT** (rendered past shift end without an approved request) to check before payroll |
 | **Reports** | Per-agent summary for any date range: attendance %, tardiness %, late minutes, absences, NCNS, undertime, rendered vs approved OT, leave days. CSV export. |
 | **Roster & Accounts** | Edit agents and accounts in a spreadsheet-style grid, or bulk-import a CSV |
-| **Settings** | Grace period, rest rules, OT caps; backup/restore; sample data |
+| **Settings** | Grace period, rest rules, OT caps, forecast history and site timezone; backup/restore; sample data |
 
 ### How the coverage finder decides
 
@@ -30,6 +31,32 @@ For the window you need covered, every active agent is checked against:
 
 Eligible agents are ranked: same account (+3) › required skill match (+2) › same LOB voice/non-voice (+1) › shift extension (+1), minus OT already done this week (spreads OT fairly).
 Cover types: **Rest Day OT**, **Pre/Post-shift OT**, or **Same-day OT (separate block)**. You can cover a partial window (e.g. split a 9h shift between two people).
+
+### Interval Planner: how the numbers are made
+
+**1. Forecast volume per 30 min.** For the date you pick, the app takes the same weekday from the last *N* weeks (default 6, changeable) and averages each interval, weighting recent weeks more (newest week counts 6×, oldest 1×). AHT is averaged the same way, weighted by volume. Use **Volume adj. %** to lift or cut the forecast for promos, billing cycles, outages or new launches.
+
+**2. Required HC per interval.**
+- **Voice:** Erlang C — the fewest agents that hit your service level (e.g. 80% answered in 20s) without going over max occupancy.
+- **Chat:** same, with AHT divided by **chats at once** (concurrency).
+- **Email / Back Office:** workload ÷ occupancy (volume × AHT ÷ 1,800s ÷ max occupancy).
+- Then **Required HC = on-queue need ÷ (1 − shrinkage)**. Shrinkage covers breaks, lunch, coaching, meetings, system issues, etc. (default 30%).
+
+**3. Scheduled HC per interval.** Everyone on shift for that account in that half hour: default shifts and schedule changes, minus approved leaves and Absent/NCNS, plus approved OT and coverage. Coverage OT counts toward the account being covered. Partial intervals count partially (a 22:15 start counts as 0.5 in the 22:00 interval). Training and holidays are not counted.
+
+**4. Variance = Scheduled HC − Required HC.** Negative (red) = understaffed, positive (green) = overstaffed. **Projected SL** is the service level you'd get if the scheduled agents (after shrinkage) work the forecast.
+
+**Account settings** (Roster & Accounts → Accounts): Channel, SL target %, SL seconds, Chats at once, Shrinkage %, Max occupancy %. Blank values use these defaults:
+
+| Channel | SL | Chats at once | Shrinkage | Max occupancy |
+|---|---|---|---|---|
+| Voice | 80% in 20s | 1 | 30% | 85% |
+| Chat | 80% in 60s | 2 | 30% | 85% |
+| Email / Back Office | (workload) | 1 | 30% | 90% |
+
+**Loading volume history** (Interval Planner → Volume data): upload a CSV export from your ACD/dialer, chat or ticketing tool with
+`date, interval, volume` and optionally `aht` (seconds) and `account`. Common header names like *Calls Offered*, *Contacts*, *Handle Time* are recognized, times like `13:30` or `1:30 PM` both work, and 15-minute data is combined into 30-minute intervals.
+Pick the **timezone of the file** (US clients usually report in their own time). The app converts to your site timezone (Settings, default Asia/Manila), including daylight saving changes. Upload at least 2–3 weeks; 6–8 weeks gives a steadier forecast. Keep adding each week's actuals so the forecast stays current and the day view can show forecast accuracy.
 
 ### Attendance rules
 
@@ -126,7 +153,8 @@ Because the data lives in Google Sheets, nothing is lost when the free app sleep
 ## Daily routine for the scheduler
 
 1. Start of shift — **Dashboard**: check open gaps and headcount variance.
-2. **Coverage Finder**: fill each gap.
-3. During/after shift — **Attendance**: enter time logs (or "Mark blanks as Present", then fix exceptions), Save.
-4. **Leaves / Overtime**: approve pending requests.
-5. Weekly/cut-off — **Reports**: export for payroll and coaching.
+2. **Interval Planner**: find the red intervals, then use **Coverage Finder** with a partial window (e.g. 01:00–04:00) to add OT exactly where it's needed. Use the week heatmap when building next week's schedule.
+3. **Coverage Finder**: fill each leave/absence gap.
+4. During/after shift — **Attendance**: enter time logs (or "Mark blanks as Present", then fix exceptions), Save.
+5. **Leaves / Overtime**: approve pending requests.
+6. Weekly/cut-off — **Reports**: export for payroll and coaching.
