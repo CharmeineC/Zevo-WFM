@@ -1,0 +1,6 @@
+# Keep credentials and local data out of GitHub
+.streamlit/secrets.toml
+*.json
+wfm.db
+*.db
+__pycache__/
