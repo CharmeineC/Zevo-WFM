@@ -80,11 +80,11 @@ DEFAULT_SETTINGS = {
     "ot_max_ext_hrs": "4",     # longest pre/post-shift extension
     "rd_ot_max_hrs": "9",      # longest rest-day OT block
     "ot_min_eff_pct": "60",    # an OT block must spend at least this % of its time in short intervals
-    "site_tz": "Asia/Manila",  # timezone schedules are written in
-    "break_min": "15",         # minutes allowed per short break
-    "breaks_allowed": "2",     # short breaks per shift
+    "site_tz": "America/Chicago",  # timezone schedules and the time clock follow
+    "break_min": "30",         # minutes allowed per break
+    "breaks_allowed": "1",     # breaks per shift
     "lunch_min": "60",         # minutes allowed for lunch
-    "lunches_allowed": "1",
+    "lunches_allowed": "0",    # 0 = no lunch (the Start lunch button is hidden)
     "login_early_hrs": "4",    # how early before a shift an agent can log in to it
     "auto_absent": "1",        # mark agents with a login Absent when they never log in for a shift
 }
@@ -609,6 +609,76 @@ def save_attendance(agent_id, date, time_in, time_out, status, late, ut, ot, rem
        (agent_id, str(date), *cols.values()))
 
 
+def _day(d):
+    return f"{d:%a %b %d}"
+
+
+def check_time_off(agent_id, d1, d2):
+    """Validate a time-off request against the agent's real schedule. Returns (working_days, error)."""
+    if d2 < d1:
+        return 0, "End date is before start date."
+    if (d2 - d1).days > 60:
+        return 0, "That's more than 60 days — please split it into smaller requests."
+    sch = build_schedule(d1, d2, agent_id=agent_id)
+    kinds = dict(zip(sch.date, sch.kind))
+    off = {"Rest Day": "your rest day", "Holiday": "a holiday"}
+    for d, label in ((d1, "start"), (d2, "end")):
+        k = kinds.get(str(d))
+        if k in off:
+            return 0, (f"{_day(d)} is {off[k]} — you can't file time off on it. "
+                       f"Time off must {label} on a working day.")
+    clash = q("SELECT leave_type, start_date, end_date FROM leaves WHERE agent_id=? AND status IN ('Pending','Approved') "
+              "AND start_date<=? AND end_date>=?", (agent_id, str(d2), str(d1)))
+    if len(clash):
+        c = clash.iloc[0]
+        return 0, f"There's already time off filed for {c.start_date} → {c.end_date} ({c.leave_type})."
+    days = sum(1 for k in kinds.values() if k in WORK_KINDS)
+    if days == 0:
+        return 0, "There are no working days in those dates."
+    return days, None
+
+
+def check_ot(agent_id, d, start, end, ot_type):
+    """Validate an OT request: it must fall outside the agent's scheduled hours. Returns (hours, error)."""
+    if not (re.fullmatch(TIME_RE, start or "") and re.fullmatch(TIME_RE, end or "") and start and end):
+        return 0, "Times must be HH:MM (24-hour), e.g. 07:00."
+    sch = build_schedule(d - ONE_DAY, d + ONE_DAY, agent_id=agent_id)
+    rows = {r.date: r for r in sch.itertuples()}
+    today = rows.get(str(d))
+    if today is not None and today.kind == "Leave":
+        return 0, f"You're on approved time off on {_day(d)}."
+    shifts = [(r.date, *shift_window(dt.date.fromisoformat(r.date), r.shift_start, r.shift_end), r.shift_start,
+               r.shift_end) for r in sch.itertuples() if r.kind in WORK_KINDS]
+    base = next(((s, e) for dd, s, e, *_ in shifts if dd == str(d)), None)
+    ws, we = place_ot(d, start, end, base) if base else shift_window(d, start, end)
+    hrs = round((we - ws).total_seconds() / 3600, 2)
+    for dd, s, e, ss, se in shifts:
+        if ws < e and s < we:
+            return 0, (f"{start}–{end} overlaps your scheduled shift {ss}–{se} ({_day(dt.date.fromisoformat(dd))}). "
+                       "OT can only be filed outside your schedule.")
+    works_today = base is not None
+    if ot_type == "Rest Day OT" and works_today:
+        return 0, f"{_day(d)} is a working day for you — choose Pre-shift or Post-shift OT."
+    if ot_type in ("Pre-shift OT", "Post-shift OT") and not works_today:
+        return 0, f"You have no shift on {_day(d)} — choose Rest Day OT."
+    if ot_type == "Pre-shift OT" and we > base[0]:
+        return 0, f"Pre-shift OT must end by your shift start ({base[0]:%H:%M})."
+    if ot_type == "Post-shift OT" and ws < base[1]:
+        return 0, f"Post-shift OT must start at or after your shift end ({base[1]:%H:%M})."
+    if hrs > setting("max_daily_hrs"):
+        return 0, f"That's {hrs:g}h — longer than the {setting('max_daily_hrs'):g}h limit."
+    mine = q("SELECT date, start_time, end_time, status FROM ot_requests WHERE agent_id=? "
+             "AND status IN ('Pending','Approved') AND date BETWEEN ? AND ?",
+             (agent_id, str(d - ONE_DAY), str(d + ONE_DAY)))
+    for r in mine.itertuples():
+        od = dt.date.fromisoformat(r.date)
+        ob = next(((s, e) for dd, s, e, *_ in shifts if dd == r.date), None)
+        os_, oe = place_ot(od, r.start_time, r.end_time, ob) if ob else shift_window(od, r.start_time, r.end_time)
+        if ws < oe and os_ < we:
+            return 0, f"This overlaps OT you already filed ({r.date} {r.start_time}–{r.end_time}, {r.status})."
+    return hrs, None
+
+
 def working_days(rest_days, start, end):
     rds = rest_set(rest_days)
     return sum(1 for d in pd.date_range(start, end) if DAYS[d.weekday()] not in rds)
@@ -993,8 +1063,11 @@ def page_leaves(acct):
             d2 = c[2].date_input("To", today_site() + ONE_DAY, key="lv_d2")
             reason = st.text_input("Reason")
             if d2 >= d1:
-                days = working_days(arow.rest_days, d1, d2)
-                st.write(f"**{days}** working day(s) — rest days ({arow.rest_days}) not counted.")
+                days, prob = check_time_off(aid, d1, d2)
+                if prob:
+                    st.warning(prob.replace("you can't", "time off can't").replace("You're", "They're"))
+                else:
+                    st.write(f"**{days}** working day(s) — rest days ({arow.rest_days}) not counted.")
                 load = leave_load(arow.account, d1, d2)
                 load["after_approval"] = load.on_leave + 1
                 over = load[load.after_approval > load.allowed]
@@ -1004,8 +1077,9 @@ def page_leaves(acct):
                 with st.expander("Leave load for these dates"):
                     st.dataframe(load, hide_index=True)
             if st.button("Submit time off", type="primary"):
-                if d2 < d1:
-                    st.error("End date is before start date.")
+                days, err = check_time_off(aid, d1, d2)
+                if err:
+                    st.error(err.replace("you can't", "time off can't").replace("You're", "They're"))
                 else:
                     ex("INSERT INTO leaves(agent_id,leave_type,start_date,end_date,days,status,reason,filed_on) "
                        "VALUES(?,?,?,?,?,?,?,?)", (aid, ltype, str(d1), str(d2), days, "Pending", reason,
@@ -1145,13 +1219,12 @@ def page_ot(acct):
                 e = c[3].text_input("To (HH:MM)", "09:00")
                 reason = st.text_input("Reason / business need")
                 if st.form_submit_button("File OT"):
-                    if not (re.fullmatch(TIME_RE, s) and re.fullmatch(TIME_RE, e) and s and e):
-                        st.error("Times must be HH:MM.")
+                    hrs, err = check_ot(aid, d, s, e, typ)
+                    if err:
+                        st.error(err.replace("your ", "their ").replace("You ", "They ").replace("You're", "They're"))
                     else:
-                        ws, we = shift_window(d, s, e)
                         ex("INSERT INTO ot_requests(agent_id,date,ot_type,start_time,end_time,hours,reason,status,filed_on) "
-                           "VALUES(?,?,?,?,?,?,?,?,?)", (aid, str(d), typ, s, e,
-                                                         round((we - ws).total_seconds() / 3600, 2), reason,
+                           "VALUES(?,?,?,?,?,?,?,?,?)", (aid, str(d), typ, s, e, hrs, reason,
                                                          "Pending", str(today_site())))
                         st.success("OT filed.")
     with t2:
@@ -1427,9 +1500,10 @@ def page_settings():
         c = st.columns(6)
         vals["break_min"] = c[0].number_input("Break length (min)", 1.0, 120.0, setting("break_min"), step=5.0)
         vals["breaks_allowed"] = c[1].number_input("Breaks per shift", 0.0, 10.0, setting("breaks_allowed"), step=1.0)
-        vals["lunch_min"] = c[2].number_input("Lunch length (min)", 1.0, 180.0, setting("lunch_min"), step=5.0)
+        vals["lunch_min"] = c[2].number_input("Lunch length (min)", 1.0, 180.0, setting("lunch_min"), step=5.0,
+                                              help="Ignored when lunches per shift is 0")
         vals["lunches_allowed"] = c[3].number_input("Lunches per shift", 0.0, 3.0, setting("lunches_allowed"),
-                                                    step=1.0)
+                                                    step=1.0, help="0 hides the Start lunch button")
         vals["login_early_hrs"] = c[4].number_input("Can log in up to (h) early", 0.5, 8.0,
                                                     setting("login_early_hrs"), step=0.5)
         vals["auto_absent"] = 1.0 if c[5].toggle("Auto-mark no-shows Absent", bool(int(setting("auto_absent"))),
@@ -1475,7 +1549,7 @@ def page_settings():
 
 
 # ----------------------------------------------------------------- interval planner
-COMMON_TZ = ["Asia/Manila", "America/New_York", "America/Chicago", "America/Denver", "America/Phoenix",
+COMMON_TZ = ["America/Chicago", "Asia/Manila", "America/New_York", "America/Denver", "America/Phoenix",
              "America/Los_Angeles", "America/Anchorage", "Pacific/Honolulu", "America/Toronto", "Europe/London",
              "Europe/Berlin", "Australia/Sydney", "Asia/Singapore", "Asia/Kolkata", "UTC"]
 INTERVAL_SEC = INTERVAL_MIN * 60
@@ -2588,14 +2662,20 @@ def _clock_panel(aid):
                     kind, m = b["ongoing"]
                     lim = b["allowed"][kind][0]
                     msg = f"{kind.title()} running for **{m} min** (allowed {lim:g})"
-                    (st.error if m > lim else st.info)(msg + (" — please end it now." if m > lim else ""))
+                    if m > lim:
+                        st.error(msg + " — please end it now.")
+                    else:
+                        st.info(msg)
                 used_b, used_l = b["used"]["break"], b["used"]["lunch"]
-                st.caption(f"Breaks used: {len(used_b)}/{b['allowed']['break'][1]} · "
-                           f"Lunch used: {len(used_l)}/{b['allowed']['lunch'][1]} · over-break so far: {b['over']} min")
+                lunch_txt = (f"Lunch used: {len(used_l)}/{b['allowed']['lunch'][1]} · "
+                             if b["allowed"]["lunch"][1] else "")
+                st.caption(f"Breaks used: {len(used_b)}/{b['allowed']['break'][1]} "
+                           f"({b['allowed']['break'][0]:g} min each) · {lunch_txt}over-break so far: {b['over']} min")
         with c[1]:
             acts = {"out": [("login", "▶️ Log in", "primary")],
-                    "in": [("break_start", "☕ Start break", "secondary"), ("lunch_start", "🍱 Start lunch", "secondary"),
-                           ("logout", "⏹️ Log out", "primary")],
+                    "in": [("break_start", "☕ Start break", "secondary")]
+                    + ([("lunch_start", "🍱 Start lunch", "secondary")] if int(setting("lunches_allowed")) else [])
+                    + [("logout", "⏹️ Log out", "primary")],
                     "break": [("break_end", "✅ End break", "primary"), ("logout", "⏹️ Log out", "secondary")],
                     "lunch": [("break_end", "✅ End lunch", "primary"), ("logout", "⏹️ Log out", "secondary")]}[state]
             for act, lbl, kind in acts:
@@ -2605,7 +2685,10 @@ def _clock_panel(aid):
                     st.rerun()
             if st.session_state.get("clock_msg"):
                 ok, msg = st.session_state.pop("clock_msg")
-                (st.success if ok else st.error)(msg)
+                if ok:
+                    st.success(msg)
+                else:
+                    st.error(msg)
 
 
 def page_my_requests():
@@ -2626,23 +2709,20 @@ def page_my_requests():
             d2 = c[2].date_input("To", today_site() + ONE_DAY)
             reason = st.text_input("Reason")
             if st.form_submit_button("Submit time off", type="primary"):
-                clash = q("SELECT id FROM leaves WHERE agent_id=? AND status IN ('Pending','Approved') "
-                          "AND start_date<=? AND end_date>=?", (aid, str(d2), str(d1)))
-                if d2 < d1:
-                    st.error("End date is before start date.")
-                elif d1 < today_site() and ltype.startswith("Planned"):
-                    st.error("Planned time off must be in the future.")
-                elif len(clash):
-                    st.error("You already have time off filed for some of these dates.")
+                days, err = check_time_off(aid, d1, d2)
+                if not err and d1 < today_site() and ltype.startswith("Planned"):
+                    err = "Planned time off must be in the future."
+                if err:
+                    st.error(err)
                 else:
-                    days = working_days(ag.rest_days, d1, d2)
                     ex("INSERT INTO leaves(agent_id,leave_type,start_date,end_date,days,status,reason,filed_on) "
                        "VALUES(?,?,?,?,?,?,?,?)", (aid, ltype, str(d1), str(d2), days, "Pending", reason,
                                                    str(today_site())))
                     st.success(f"Filed {days:g} working day(s) — waiting for approval.")
     with t2:
-        st.caption("OT is paid only when approved. Times are your site time (24h). For OT after a graveyard "
-                   "shift, use the date your shift started.")
+        st.caption("OT must be outside your scheduled shift and is paid only when approved. Times are "
+                   f"{setting_str('site_tz').split('/')[-1].replace('_', ' ')} time, 24-hour. For OT right after a "
+                   "graveyard shift, use the date your shift started.")
         with st.form("my_ot"):
             c = st.columns(4)
             d = c[0].date_input("Shift date", today_site())
@@ -2651,27 +2731,29 @@ def page_my_requests():
             e_ = c[3].text_input("To (HH:MM)", "09:00")
             reason = st.text_input("Reason")
             if st.form_submit_button("Submit OT", type="primary"):
-                if not (re.fullmatch(TIME_RE, s_) and re.fullmatch(TIME_RE, e_) and s_ and e_):
-                    st.error("Times must be HH:MM, e.g. 07:00.")
+                hrs, err = check_ot(aid, d, s_, e_, typ)
+                if err:
+                    st.error(err)
                 else:
-                    ws, we = shift_window(d, s_, e_)
-                    hrs = round((we - ws).total_seconds() / 3600, 2)
-                    if hrs > setting("max_daily_hrs"):
-                        st.error(f"That's {hrs:g}h — longer than the {setting('max_daily_hrs'):g}h limit.")
-                    else:
-                        ex("INSERT INTO ot_requests(agent_id,date,ot_type,start_time,end_time,hours,reason,status,"
-                           "filed_on,for_account) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                           (aid, str(d), typ, s_, e_, hrs, reason, "Pending", str(today_site()), ag.account))
-                        st.success(f"Filed {hrs:g}h OT — waiting for approval.")
+                    ex("INSERT INTO ot_requests(agent_id,date,ot_type,start_time,end_time,hours,reason,status,"
+                       "filed_on,for_account) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                       (aid, str(d), typ, s_, e_, hrs, reason, "Pending", str(today_site()), ag.account))
+                    st.success(f"Filed {hrs:g}h OT — waiting for approval.")
     with t3:
         lv = q("SELECT id, leave_type AS type, start_date, end_date, days, status, reason FROM leaves "
                "WHERE agent_id=? ORDER BY start_date DESC LIMIT 50", (aid,))
         ot = q("SELECT id, date, ot_type AS type, start_time, end_time, hours, status, reason FROM ot_requests "
                "WHERE agent_id=? ORDER BY date DESC LIMIT 50", (aid,))
         st.markdown("**Time off**")
-        st.dataframe(lv.drop(columns="id"), hide_index=True, width="stretch") if len(lv) else st.caption("None yet.")
+        if len(lv):
+            st.dataframe(lv.drop(columns="id"), hide_index=True, width="stretch")
+        else:
+            st.caption("None yet.")
         st.markdown("**Overtime**")
-        st.dataframe(ot.drop(columns="id"), hide_index=True, width="stretch") if len(ot) else st.caption("None yet.")
+        if len(ot):
+            st.dataframe(ot.drop(columns="id"), hide_index=True, width="stretch")
+        else:
+            st.caption("None yet.")
         pend = {f"lv{r.id}": f"Time off · {r.type} · {r.start_date}→{r.end_date}"
                 for r in lv[lv.status == "Pending"].itertuples()}
         pend.update({f"ot{r.id}": f"OT · {r.date} {r.start_time}-{r.end_time}"

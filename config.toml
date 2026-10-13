@@ -1,3 +1,7 @@
 [client]
 # hide the developer menu from agents
 toolbarMode = "minimal"
+
+[runner]
+# never auto-print stray values on the page
+magicEnabled = false

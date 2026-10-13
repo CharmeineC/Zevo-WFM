@@ -72,7 +72,7 @@ Everyone keeps their permanent schedule. **Interval Planner → 🧮 OT plan →
 
 **Loading volume history** (Interval Planner → Volume data): upload a CSV export from your ACD/dialer, chat or ticketing tool with
 `date, interval, volume` and optionally `aht` (seconds) and `account`. Common header names like *Calls Offered*, *Contacts*, *Handle Time* are recognized, times like `13:30` or `1:30 PM` both work, and 15-minute data is combined into 30-minute intervals.
-Pick the **timezone of the file** (US clients usually report in their own time). The app converts to your site timezone (Settings, default Asia/Manila), including daylight saving changes. Upload at least 2–3 weeks; 6–8 weeks gives a steadier forecast. Keep adding each week's actuals so the forecast stays current and the day view can show forecast accuracy.
+Pick the **timezone of the file** (US clients usually report in their own time). The app converts to your site timezone (Settings, default US Central time — America/Chicago), including daylight saving changes. Upload at least 2–3 weeks; 6–8 weeks gives a steadier forecast. Keep adding each week's actuals so the forecast stays current and the day view can show forecast accuracy.
 
 ### Logins and the time clock
 
@@ -83,11 +83,13 @@ Pick the **timezone of the file** (US clients usually report in their own time).
 **How the clock matches the schedule.**
 - **Log in** attaches to the shift that's starting or running — up to 4 hours early (setting), or earlier if the agent has approved pre-shift OT. Graveyard shifts work across midnight: a 22:00 Mon log in and 07:00 Tue log out both count for Monday's shift.
 - **Late** = log in after shift start + grace period. **Undertime** = log out before shift end. **Rendered OT** = time before the shift start or after the shift end, in 30-minute blocks.
-- **Breaks:** default 2 × 15-minute breaks and 1 × 60-minute lunch per shift. Minutes beyond the allowance are **over-break**; an extra break beyond the allowed number counts in full. Logging out during a break ends the break.
+- **Breaks:** default 1 × 30-minute break per shift and no lunch (the **Start lunch** button only appears if lunches per shift is set above 0). Minutes beyond the allowance are **over-break**; an extra break beyond the allowed number counts in full. Logging out during a break ends the break. Change the rules under **Settings → Time clock**.
+- **Filing OT:** the time must be outside the agent's scheduled shift — overlapping a shift, choosing Rest Day OT on a working day (or pre/post-shift OT on a rest day), filing during approved time off, or overlapping OT they already filed is rejected with a message.
+- **Filing time off:** it can't start or end on a rest day or holiday, and rest days inside a range aren't counted. 1 or 2 rest days (or more) per agent are both fine — list them in the roster's rest days column, e.g. `Sun` or `Sat,Sun`.
 - **Log out → log back in** (disconnection) keeps the first log in time. Logging in with no shift scheduled (e.g. a rest day without approved RD OT) is recorded as **Unscheduled**.
 - **No-shows:** agents who have a login and never log in are marked **Absent ("Auto: no log in")** one hour after their shift ends. Agents without a login are never auto-marked. Turn this off in Settings if you need to.
 - **Forgot to log out:** the next log in flags the old shift **"No log out"**. Fix it in **Attendance → Clock logs → Add a missing event**; attendance recalculates.
-- All clock times use the **site timezone** in Settings (default Asia/Manila), even though the cloud server runs on UTC.
+- All clock times use the **site timezone** in Settings (default US Central — America/Chicago, daylight saving handled), even though the cloud server runs on UTC.
 
 **Notes.** Refreshing the browser signs you out (sign in again). Agents' clicks are saved to the Google Sheet in small batches every few seconds, so 20+ agents logging in at once stay well within Google's limits; admin actions save immediately.
 
