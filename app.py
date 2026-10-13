@@ -1888,7 +1888,24 @@ def page_interval(acct):
         cov = q("SELECT account, MIN(date) AS first_date, MAX(date) AS last_date, COUNT(DISTINCT date) AS days, "
                 "ROUND(SUM(volume)) AS total_volume FROM interval_volume GROUP BY account ORDER BY account")
         st.markdown("**History loaded**")
-        st.dataframe(cov, hide_index=True, width="stretch") if len(cov) else st.caption("No volume history yet.")
+        if not len(cov):
+            st.caption("No volume history yet.")
+        else:
+            cov["in_account_list"] = np.where(cov.account.isin(accts), "Yes", "No — leftover/sample")
+            st.dataframe(cov, hide_index=True, width="stretch")
+            orphans = cov[~cov.account.isin(accts)].account.tolist()
+            if orphans:
+                st.caption("⚠️ Some history belongs to accounts that aren't in your account list any more "
+                           "(for example the sample accounts). Delete it below.")
+            c = st.columns([3, 1.4])
+            chosen = c[0].multiselect("Delete ALL volume history for", cov.account.tolist(), default=orphans,
+                                      key="iv_hist_del")
+            if c[1].button("🗑️ Delete history", disabled=not chosen, key="iv_hist_btn", width="stretch"):
+                for a in chosen:
+                    ex("DELETE FROM interval_volume WHERE account=?", (a,))
+                st.session_state.pop("ot_plan", None)
+                st.session_state.pop("iv_hist_del", None)
+                rerun()
         st.markdown("**Upload interval volume** (CSV from your ACD, chat or ticketing platform)")
         st.caption("Columns: `date`, `interval` (start time, e.g. 13:30 or 1:30 PM), `volume` (offered/received), "
                    "and optionally `aht` in seconds and `account`. A single `datetime` column also works. "
@@ -1932,13 +1949,23 @@ def page_interval(acct):
                     rerun()
             except Exception as e:
                 st.error(f"Couldn't read that file: {e}")
-        with st.expander("Delete volume history"):
-            c = st.columns(3)
-            d1 = c[0].date_input("From", dt.date.today() - dt.timedelta(days=7), key="iv_del1")
-            d2 = c[1].date_input("To", dt.date.today(), key="iv_del2")
-            if c[2].button(f"Delete {account} volume in range"):
-                ex("DELETE FROM interval_volume WHERE account=? AND date BETWEEN ? AND ?", (account, str(d1), str(d2)))
-                rerun()
+        with st.expander("Delete part of an account's history (date range)"):
+            have = cov.account.tolist() if len(cov) else []
+            if not have:
+                st.caption("Nothing to delete.")
+            else:
+                c = st.columns(4)
+                del_acc = c[0].selectbox("Account", have, index=have.index(account) if account in have else 0,
+                                         key="iv_del_acc")
+                row = cov[cov.account == del_acc].iloc[0]
+                lo, hi = dt.date.fromisoformat(row.first_date), dt.date.fromisoformat(row.last_date)
+                d1 = c[1].date_input("From", lo, key=f"iv_del1_{del_acc}")
+                d2 = c[2].date_input("To", hi, key=f"iv_del2_{del_acc}")
+                if c[3].button("Delete range", key="iv_del_btn"):
+                    ex("DELETE FROM interval_volume WHERE account=? AND date BETWEEN ? AND ?",
+                       (del_acc, str(d1), str(d2)))
+                    st.session_state.pop("ot_plan", None)
+                    rerun()
 
 
 # ----------------------------------------------------------------- layout
