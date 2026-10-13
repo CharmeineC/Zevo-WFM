@@ -7,10 +7,13 @@ If Google isn't set up, the app falls back to a local file, `wfm.db`, which is h
 
 ## What it does
 
+**Two kinds of login.** Agents see only their own **🕒 My Shift** (log in / break / lunch / log out, their schedule and recent attendance) and **📝 My Requests** (file time off and OT for approval). Admins see everything below plus **🟢 Live Floor** and **🔐 Users**.
+
 | Page | Use it for |
 |---|---|
+| **Live Floor** | Who's working, on break, over break, late or not logged in right now — refreshes every 30 seconds |
 | **Dashboard** | Today's staffing per account: **required HC calculated from volume**, scheduled vs present, lates, absences/NCNS, time off, coverage and OT hours, headcount variance, short intervals, open gaps, 14-day trend |
-| **Attendance** | Daily log sheet. Type time in/out (24h HH:MM); late, undertime and rendered OT are computed automatically. Handles graveyard/overnight shifts (e.g. 22:00–07:00). |
+| **Attendance** | Filled automatically from agents' log ins/outs: late, undertime, breaks, over-breaks and rendered OT. Admins can still type or correct times, and fix clock events (e.g. a forgotten log out) under **Clock logs**. Handles graveyard/overnight shifts (e.g. 22:00–07:00). |
 | **Interval Planner** | 30-minute volume forecast, required HC (Erlang C for voice/chat, workload for email/back office), scheduled HC and **HC variance per interval**, projected service level, forecast vs actual, a weekly variance heatmap, and the **🧮 OT plan**: who should do OT and when to fill the short intervals |
 | **Schedules** | Weekly roster grid of everyone's permanent schedule (color-coded rest days, time off, RD OT, training). One-off exceptions like training, holidays or swaps can be set here; day-to-day staffing is adjusted with OT. |
 | **Time Off** | File time off (counts working days only), cap warning when too many people on one account are off the same day, approve/deny, calendar, days-off summary per contractor. No leave credits — built for independent contractors. |
@@ -18,7 +21,8 @@ If Google isn't set up, the app falls back to a local file, `wfm.db`, which is h
 | **Overtime** | File and approve OT, weekly OT vs cap, and **unapproved OT** (rendered past shift end without an approved request) to check before payroll |
 | **Reports** | Per-agent summary for any date range: attendance %, tardiness %, late minutes, absences, NCNS, undertime, rendered vs approved OT, leave days. CSV export. |
 | **Roster & Accounts** | Edit agents and accounts in a spreadsheet-style grid, or bulk-import a CSV |
-| **Settings** | Grace period, rest rules, OT caps, forecast history and site timezone; backup/restore; sample data |
+| **Users** | Create logins for all agents in one click (temporary passwords), add admins, reset passwords, unlock, disable |
+| **Settings** | Grace period, rest rules, OT caps, forecast history, site timezone, break/lunch rules; backup/restore; sample data |
 
 ### How the coverage finder decides
 
@@ -70,6 +74,23 @@ Everyone keeps their permanent schedule. **Interval Planner → 🧮 OT plan →
 `date, interval, volume` and optionally `aht` (seconds) and `account`. Common header names like *Calls Offered*, *Contacts*, *Handle Time* are recognized, times like `13:30` or `1:30 PM` both work, and 15-minute data is combined into 30-minute intervals.
 Pick the **timezone of the file** (US clients usually report in their own time). The app converts to your site timezone (Settings, default Asia/Manila), including daylight saving changes. Upload at least 2–3 weeks; 6–8 weeks gives a steadier forecast. Keep adding each week's actuals so the forecast stays current and the day view can show forecast accuracy.
 
+### Logins and the time clock
+
+**First-time setup.** The first person to open a fresh app creates the **admin login**. To make sure nobody else can do that, add a line `setup_code = "pick-a-secret"` to your secrets, at the top next to `sheet_url` (above the `[gcp_service_account]` line — see `secrets.toml.example`); the app then asks for that code before creating the first admin. Add more admins under **Users → Add a user**.
+
+**Agent logins.** Import your roster first, then **Users → Create agent logins**. Each agent gets username = employee ID and a random temporary password, shown once (download the list and send each person theirs privately). They set their own password the first time they sign in. Passwords are stored encrypted (salted PBKDF2), and 5 wrong tries lock the login for 10 minutes (admins can unlock it). If someone forgets their password, an admin uses **Reset password**.
+
+**How the clock matches the schedule.**
+- **Log in** attaches to the shift that's starting or running — up to 4 hours early (setting), or earlier if the agent has approved pre-shift OT. Graveyard shifts work across midnight: a 22:00 Mon log in and 07:00 Tue log out both count for Monday's shift.
+- **Late** = log in after shift start + grace period. **Undertime** = log out before shift end. **Rendered OT** = time before the shift start or after the shift end, in 30-minute blocks.
+- **Breaks:** default 2 × 15-minute breaks and 1 × 60-minute lunch per shift. Minutes beyond the allowance are **over-break**; an extra break beyond the allowed number counts in full. Logging out during a break ends the break.
+- **Log out → log back in** (disconnection) keeps the first log in time. Logging in with no shift scheduled (e.g. a rest day without approved RD OT) is recorded as **Unscheduled**.
+- **No-shows:** agents who have a login and never log in are marked **Absent ("Auto: no log in")** one hour after their shift ends. Agents without a login are never auto-marked. Turn this off in Settings if you need to.
+- **Forgot to log out:** the next log in flags the old shift **"No log out"**. Fix it in **Attendance → Clock logs → Add a missing event**; attendance recalculates.
+- All clock times use the **site timezone** in Settings (default Asia/Manila), even though the cloud server runs on UTC.
+
+**Notes.** Refreshing the browser signs you out (sign in again). Agents' clicks are saved to the Google Sheet in small batches every few seconds, so 20+ agents logging in at once stay well within Google's limits; admin actions save immediately.
+
 ### Attendance rules
 
 - **Late**: time in later than shift start + grace period (default 5 min). Late minutes counted from shift start.
@@ -85,7 +106,7 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-It opens at http://localhost:8501. Go to **Settings → Load sample data** to try it with 3 accounts and 22 agents, then **Wipe all data** when you're ready to load your real roster.
+It opens at http://localhost:8501. Create the admin login when asked, then go to **Settings → Load sample data** to try it with 3 accounts and 22 agents, then **Wipe all data** when you're ready to load your real roster.
 
 To share it on your office network, run `streamlit run app.py --server.address 0.0.0.0` and teammates open `http://<your-PC-IP>:8501`.
 
@@ -110,7 +131,7 @@ The app logs in to Google as a **service account**: a robot Google user that onl
 2. Click **Share**, paste the service account's `client_email`, give it **Editor**, untick "Notify people", Share.
 3. Copy the sheet's URL.
 
-The app creates all the tabs it needs on first run: `accounts`, `agents`, `schedule_overrides`, `attendance`, `leaves`, `ot_requests`, `settings`, `interval_volume`.
+The app creates all the tabs it needs on first run: `accounts`, `agents`, `schedule_overrides`, `attendance`, `leaves`, `ot_requests`, `settings`, `interval_volume`, `users`, `time_logs`. The `users` tab holds encrypted passwords only — still, share the sheet with admins only.
 
 **C. Give the app the key**
 
@@ -150,7 +171,8 @@ Run the app — the sidebar shows **🟢 Google Sheet: WFM Data** when it's conn
    **Never upload `secrets.toml` or the JSON key** to GitHub.
 2. Go to https://share.streamlit.io, sign in with GitHub, click **Create app**, pick the repo and `app.py`.
 3. Before deploying, open **Advanced settings → Secrets** and paste the contents of your `secrets.toml`. Deploy.
-4. In the app's sharing settings, restrict viewers to your team's emails (agent data is personal information — don't leave it public).
+4. Decide who can open the link. Every page is behind the app's own login, so you can share the link with your agents. For an extra layer, keep the app **private** in its Streamlit sharing settings and invite each person's email — note that Streamlit's free tier allows one private app per account.
+5. Optional: also upload the `.streamlit/config.toml` file (keep the folder name) — it hides Streamlit's developer menu from agents.
 
 Because the data lives in Google Sheets, nothing is lost when the free app sleeps or restarts.
 (Without Google Sheets, the cloud app's local `wfm.db` is wiped on every restart — you'd have to download a backup from **Settings** each shift.)
@@ -161,12 +183,14 @@ Because the data lives in Google Sheets, nothing is lost when the free app sleep
 2. **Roster & Accounts → Import CSV**: download the template, fill it from your HR roster, upload.
    Rest days use `Mon,Tue,Wed,Thu,Fri,Sat,Sun` (comma-separated). Shift times are 24-hour `HH:MM`.
 3. **Interval Planner → Volume data**: upload 6–8 weeks of interval volume per account so required HC can be calculated.
+4. **Users → Create agent logins**, then send each agent their username and temporary password.
 
 ## Daily routine for the scheduler
 
-1. Start of shift — **Dashboard**: check open gaps and headcount variance.
-2. **Interval Planner → 🧮 OT plan**: build the OT plan for today (and tomorrow), approve it or send it to agents to confirm. The week heatmap shows which days will need the most OT.
-3. **Coverage Finder**: fill a specific person's full shift when they're off or absent.
-4. During/after shift — **Attendance**: enter time logs (or "Mark blanks as Present", then fix exceptions), Save.
-5. **Time Off / Overtime**: approve pending requests.
-6. Weekly/cut-off — **Reports**: export for payroll and coaching.
+1. Keep **Live Floor** open: chase anyone late or over break.
+2. Start of shift — **Dashboard**: check open gaps and headcount variance.
+3. **Interval Planner → 🧮 OT plan**: build the OT plan for today (and tomorrow), approve it or send it to agents to confirm. The week heatmap shows which days will need the most OT.
+4. **Coverage Finder**: fill a specific person's full shift when they're off or absent.
+5. After the shift — **Attendance**: review lates, over-breaks, "No log out" and auto-absences; fix clock mistakes under **Clock logs** (change Absent to NCNS where it applies).
+6. **Time Off / Overtime**: approve pending requests.
+7. Weekly/cut-off — **Reports**: export for payroll and coaching.

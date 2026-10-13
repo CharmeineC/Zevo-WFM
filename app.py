@@ -14,15 +14,18 @@ Run:  streamlit run app.py
 """
 import datetime as dt
 import hashlib
+import hmac
 import math
 import os
 import random
 import re
+import secrets
 import sqlite3
 import tempfile
 import threading
 import time
 from contextlib import closing
+from zoneinfo import ZoneInfo
 
 import altair as alt
 import numpy as np
@@ -48,7 +51,8 @@ if USE_SHEETS:
 else:
     DB_PATH = os.environ.get("WFM_DB", "wfm.db")
 TABLES = ["accounts", "agents", "schedule_overrides", "attendance", "leaves", "ot_requests", "settings",
-          "interval_volume"]
+          "interval_volume", "users", "time_logs"]
+APPEND_TABLES = {"time_logs"}  # insert-only logs are appended to the sheet instead of rewriting the tab
 _WRITE_RE = re.compile(r"^\s*(?:INSERT(?:\s+OR\s+\w+)?\s+INTO|UPDATE|DELETE\s+FROM)\s+(\w+)", re.I)
 DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 ONE_DAY = dt.timedelta(days=1)
@@ -77,6 +81,12 @@ DEFAULT_SETTINGS = {
     "rd_ot_max_hrs": "9",      # longest rest-day OT block
     "ot_min_eff_pct": "60",    # an OT block must spend at least this % of its time in short intervals
     "site_tz": "Asia/Manila",  # timezone schedules are written in
+    "break_min": "15",         # minutes allowed per short break
+    "breaks_allowed": "2",     # short breaks per shift
+    "lunch_min": "60",         # minutes allowed for lunch
+    "lunches_allowed": "1",
+    "login_early_hrs": "4",    # how early before a shift an agent can log in to it
+    "auto_absent": "1",        # mark agents with a login Absent when they never log in for a shift
 }
 CHANNELS = ["Voice", "Chat", "Email / Back Office"]
 INTERVAL_MIN = 30
@@ -110,7 +120,14 @@ CREATE TABLE IF NOT EXISTS schedule_overrides(
 CREATE TABLE IF NOT EXISTS attendance(
   agent_id INTEGER, date TEXT, time_in TEXT, time_out TEXT, status TEXT,
   late_min INTEGER DEFAULT 0, undertime_min INTEGER DEFAULT 0, ot_min INTEGER DEFAULT 0,
-  remarks TEXT, PRIMARY KEY(agent_id, date));
+  remarks TEXT, break_min INTEGER DEFAULT 0, overbreak_min INTEGER DEFAULT 0, PRIMARY KEY(agent_id, date));
+CREATE TABLE IF NOT EXISTS users(
+  username TEXT PRIMARY KEY, pw_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'agent', agent_id INTEGER,
+  active INTEGER DEFAULT 1, must_change INTEGER DEFAULT 1, failed INTEGER DEFAULT 0, locked_until TEXT,
+  last_login TEXT, created_on TEXT);
+CREATE TABLE IF NOT EXISTS time_logs(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, agent_id INTEGER, shift_date TEXT, event TEXT, ts TEXT,
+  source TEXT, note TEXT);
 CREATE TABLE IF NOT EXISTS leaves(
   id INTEGER PRIMARY KEY AUTOINCREMENT, agent_id INTEGER, leave_type TEXT,
   start_date TEXT, end_date TEXT, days REAL, status TEXT DEFAULT 'Pending',
@@ -124,9 +141,17 @@ CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
 
 
 def _conn():
-    c = sqlite3.connect(DB_PATH)
+    c = sqlite3.connect(DB_PATH, timeout=30)
     c.execute("PRAGMA foreign_keys=ON")
     return c
+
+
+class _NoLock:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
 
 
 def q(sql, params=()):
@@ -135,12 +160,17 @@ def q(sql, params=()):
 
 
 def ex(sql, params=()):
-    with closing(_conn()) as c, c:
-        cur = c.execute(sql, [_py(p) for p in params])
-        changed, rowid = cur.rowcount, cur.lastrowid
     m = _WRITE_RE.match(sql)
-    if STORE is not None and m and changed:
-        STORE.mark_dirty(m.group(1))
+    with (STORE.lock if STORE is not None else _NoLock()):  # no sheet reload can wipe a write in progress
+        with closing(_conn()) as c, c:
+            cur = c.execute(sql, [_py(p) for p in params])
+            changed, rowid = cur.rowcount, cur.lastrowid
+        if STORE is not None and m and changed:
+            table = m.group(1)
+            if table in APPEND_TABLES and re.match(r"^\s*INSERT\s+INTO", sql, re.I):
+                STORE.queue_append(table, rowid)
+            else:
+                STORE.mark_dirty(table)
     return rowid
 
 
@@ -149,11 +179,12 @@ def exmany(sql, rows):
     rows = [[_py(v) for v in r] for r in rows]
     if not rows:
         return
-    with closing(_conn()) as c, c:
-        c.executemany(sql, rows)
-    m = _WRITE_RE.match(sql)
-    if STORE is not None and m:
-        STORE.mark_dirty(m.group(1))
+    with (STORE.lock if STORE is not None else _NoLock()):
+        with closing(_conn()) as c, c:
+            c.executemany(sql, rows)
+        m = _WRITE_RE.match(sql)
+        if STORE is not None and m:
+            STORE.mark_dirty(m.group(1))
 
 
 def _py(v):
@@ -176,23 +207,43 @@ def _cell(v):
 
 
 class SheetStore:
-    """Google Sheet <-> local SQLite cache. One worksheet (tab) per table."""
+    """Google Sheet <-> local SQLite cache. One worksheet (tab) per table.
+
+    `lock` guards the local cache and the change lists (held only briefly).
+    `io_lock` serialises network work, so a reload can never overwrite changes that are still being saved.
+    A background thread saves changes every few seconds, batching bursts (e.g. 20 agents logging in at once)."""
     REFRESH_SEC = 120  # pick up edits made directly in the sheet
+    FLUSH_SEC = 4
 
     def __init__(self, secrets):
         import gspread
         gc = gspread.service_account_from_dict(dict(secrets["gcp_service_account"]))
         self.sh = gc.open_by_url(secrets["sheet_url"]) if "sheet_url" in secrets else gc.open_by_key(secrets["sheet_key"])
         self.title = self.sh.title
-        self.lock = threading.RLock()
-        self.dirty, self.ws, self.nrows = set(), {}, {}
-        self.loaded_at, self.last_error = 0.0, None
-        self.load()
+        self.lock, self.io_lock = threading.RLock(), threading.RLock()
+        self.dirty, self.appends, self.ws, self.nrows = set(), {}, {}, {}
+        self.loaded_at, self.last_error, self.last_saved = 0.0, None, None
+        self.load(force=True)
+        threading.Thread(target=self._loop, daemon=True, name="sheet-flusher").start()
 
     @staticmethod
     def cols(table):
         with closing(_conn()) as c:
             return [r[1] for r in c.execute(f"PRAGMA table_info({table})")]
+
+    @property
+    def pending(self):
+        return bool(self.dirty or any(self.appends.values()))
+
+    def _loop(self):
+        while True:
+            time.sleep(self.FLUSH_SEC)
+            if self.pending:
+                try:
+                    self.flush()
+                except Exception as e:  # kept pending; retried next round
+                    self.last_error = f"{type(e).__name__}: {e}"
+                    time.sleep(self.FLUSH_SEC * 3)
 
     def _ensure_tabs(self):
         existing = {w.title: w for w in self.sh.worksheets()}
@@ -209,67 +260,110 @@ class SheetStore:
             self.ws[t] = existing[t]
             self.nrows[t] = existing[t].row_count
 
-    def load(self):
-        """Replace the local cache with what's in the Google Sheet."""
-        with self.lock:
+    def load(self, force=False):
+        """Replace the local cache with what's in the Google Sheet (skipped while changes are unsaved)."""
+        with self.io_lock:
+            if self.pending and not force:
+                return False
             self._ensure_tabs()
             res = self.sh.values_batch_get(TABLES)
-            with closing(_conn()) as c, c:
-                for t, vr in zip(TABLES, res.get("valueRanges", [])):
-                    vals = vr.get("values", [])
-                    c.execute(f"DELETE FROM {t}")
-                    if len(vals) < 2:
-                        continue
-                    header = [str(h).strip() for h in vals[0]]
-                    pairs = [(col, header.index(col)) for col in self.cols(t) if col in header]
-                    if not pairs:
-                        continue
-                    rows = []
-                    for row in vals[1:]:
-                        if not any(str(x).strip() for x in row):
+            with self.lock:
+                if self.pending and not force:
+                    return False
+                with closing(_conn()) as c, c:
+                    for t, vr in zip(TABLES, res.get("valueRanges", [])):
+                        vals = vr.get("values", [])
+                        c.execute(f"DELETE FROM {t}")
+                        if len(vals) < 2:
                             continue
-                        rows.append([row[i] if i < len(row) and str(row[i]).strip() != "" else None
-                                     for _, i in pairs])
-                    names = ",".join(col for col, _ in pairs)
-                    marks = ",".join("?" * len(pairs))
-                    c.executemany(f"INSERT OR REPLACE INTO {t}({names}) VALUES({marks})", rows)
-            self.loaded_at = time.time()
+                        header = [str(h).strip() for h in vals[0]]
+                        pairs = [(col, header.index(col)) for col in self.cols(t) if col in header]
+                        if not pairs:
+                            continue
+                        rows = []
+                        for row in vals[1:]:
+                            if not any(str(x).strip() for x in row):
+                                continue
+                            rows.append([row[i] if i < len(row) and str(row[i]).strip() != "" else None
+                                         for _, i in pairs])
+                        names = ",".join(col for col, _ in pairs)
+                        marks = ",".join("?" * len(pairs))
+                        c.executemany(f"INSERT OR REPLACE INTO {t}({names}) VALUES({marks})", rows)
+                self.dirty.clear()
+                self.appends.clear()
+                self.loaded_at = time.time()
+            return True
 
     def mark_dirty(self, table):
         if table in TABLES:
             with self.lock:
                 self.dirty.add(table)
 
-    def flush(self):
-        """Write every changed table back to its tab."""
+    def queue_append(self, table, rowid):
         with self.lock:
-            for t in sorted(self.dirty):
-                df = q(f"SELECT * FROM {t}")
-                values = [list(df.columns)] + [[_cell(v) for v in r] for r in df.itertuples(index=False)]
-                m = len(df.columns)
-                values += [[""] * m] * max(0, 2 - len(values))  # a tab keeps >=2 rows; blank the spare one
-                n = len(values)
-                ws = self.ws[t]
-                if self.nrows[t] < n or ws.col_count < m:
-                    ws.resize(rows=max(self.nrows[t], n), cols=max(ws.col_count, m))
-                    self.nrows[t] = max(self.nrows[t], n)
-                ws.update(range_name="A1", values=values, value_input_option="RAW")
-                if self.nrows[t] > max(n, 2):  # trim rows left over from deleted records
-                    ws.resize(rows=max(n, 2))
-                    self.nrows[t] = max(n, 2)
-                self.dirty.discard(t)
-            self.last_error = None
+            self.appends.setdefault(table, []).append(rowid)
+
+    def flush(self):
+        """Write changed tabs back to the sheet (full rewrite, or append for insert-only logs)."""
+        with self.io_lock:
+            with self.lock:  # snapshot under the data lock, then talk to Google without holding it
+                rewrites = {}
+                for t in sorted(self.dirty):
+                    df = q(f"SELECT * FROM {t}")
+                    rewrites[t] = (list(df.columns), [[_cell(v) for v in r] for r in df.itertuples(index=False)])
+                appends = {}
+                for t, ids in self.appends.items():
+                    if ids and t not in rewrites:
+                        marks = ",".join("?" * len(ids))
+                        df = q(f"SELECT * FROM {t} WHERE id IN ({marks}) ORDER BY id", ids)
+                        appends[t] = (list(df.columns), [[_cell(v) for v in r] for r in df.itertuples(index=False)])
+                done_ids = {t: list(v) for t, v in self.appends.items()}
+                self.dirty.clear()
+                self.appends.clear()
+            try:
+                for t, (cols, rows) in rewrites.items():
+                    values = [cols] + rows
+                    m = len(cols)
+                    values += [[""] * m] * max(0, 2 - len(values))  # a tab keeps >=2 rows; blank the spare one
+                    n = len(values)
+                    ws = self.ws[t]
+                    if self.nrows[t] < n or ws.col_count < m:
+                        ws.resize(rows=max(self.nrows[t], n), cols=max(ws.col_count, m))
+                        self.nrows[t] = max(self.nrows[t], n)
+                    ws.update(range_name="A1", values=values, value_input_option="RAW")
+                    if self.nrows[t] > max(n, 2):  # trim rows left over from deleted records
+                        ws.resize(rows=max(n, 2))
+                        self.nrows[t] = max(n, 2)
+                    rewrites[t] = None
+                for t, (cols, rows) in appends.items():
+                    if rows:
+                        ws = self.ws[t]
+                        if ws.col_count < len(cols):
+                            ws.resize(cols=len(cols))
+                        ws.append_rows(rows, value_input_option="RAW", insert_data_option="INSERT_ROWS",
+                                       table_range="A1")
+                        self.nrows[t] += len(rows)
+                    done_ids.pop(t, None)
+            except Exception:
+                with self.lock:  # put back whatever didn't make it
+                    self.dirty.update(t for t, v in rewrites.items() if v is not None)
+                    for t, ids in done_ids.items():
+                        if t in appends or t in rewrites:
+                            self.appends.setdefault(t, [])[:0] = ids
+                raise
+            self.last_error, self.last_saved = None, time.time()
 
     def maybe_refresh(self):
-        with self.lock:
-            if not self.dirty and time.time() - self.loaded_at > self.REFRESH_SEC:
-                self.load()
+        if not self.pending and time.time() - self.loaded_at > self.REFRESH_SEC:
+            self.load()
 
 
 def init_db():
     with closing(_conn()) as c, c:
+        c.execute("PRAGMA journal_mode=WAL")  # many agents reading/writing at once
         c.executescript(SCHEMA)
-        for table, extra in (("accounts", ACCOUNT_EXTRA_COLS), ("ot_requests", {"for_account": "TEXT"})):
+        for table, extra in (("accounts", ACCOUNT_EXTRA_COLS), ("ot_requests", {"for_account": "TEXT"}),
+                             ("attendance", {"break_min": "INTEGER", "overbreak_min": "INTEGER"})):
             have = {r[1] for r in c.execute(f"PRAGMA table_info({table})")}
             for col, typ in extra.items():  # upgrade databases made by older versions
                 if col not in have:
@@ -289,15 +383,20 @@ def get_store():
     return SheetStore(SECRETS)
 
 
-def flush_to_sheet():
-    if STORE is None or not STORE.dirty:
+def flush_to_sheet(sync=None):
+    """Save pending changes. Admin actions save right away; agent clicks are batched by the background saver."""
+    if STORE is None or not STORE.pending:
+        return True
+    if sync is None:
+        sync = is_admin()
+    if not sync:
         return True
     try:
         STORE.flush()
         return True
-    except Exception as e:  # keep tables dirty; retried on next save
+    except Exception as e:  # kept pending; the background saver retries
         STORE.last_error = str(e)
-        st.error(f"Couldn't save to Google Sheets yet (will retry on the next action): {e}")
+        st.error(f"Couldn't save to Google Sheets yet (it will keep retrying automatically): {e}")
         return False
 
 
@@ -329,6 +428,34 @@ def setting_str(key):
 
 def setting(key):
     return float(setting_str(key))
+
+
+def site_tz():
+    try:
+        return ZoneInfo(setting_str("site_tz"))
+    except Exception:
+        return ZoneInfo(DEFAULT_SETTINGS["site_tz"])
+
+
+def now_site():
+    """Current wall-clock time at the site (naive). Streamlit Cloud servers run on UTC."""
+    fake = os.environ.get("WFM_TEST_NOW")  # automated tests only
+    if fake:
+        return dt.datetime.fromisoformat(fake)
+    return dt.datetime.now(site_tz()).replace(tzinfo=None, microsecond=0)
+
+
+def today_site():
+    return now_site().date()
+
+
+def current_user():
+    return st.session_state.get("auth")
+
+
+def is_admin():
+    u = current_user()
+    return bool(u and u.get("role") == "admin")
 
 
 STORE = None
@@ -439,25 +566,45 @@ def build_schedule(start, end, account=None):
 
 
 def compute_attendance(day, shift_start, shift_end, time_in, time_out, status):
-    """Returns (status, late_min, undertime_min, ot_min)."""
+    """Returns (status, late_min, undertime_min, ot_min) from HH:MM time logs."""
     if status in ("Absent", "NCNS", "On Leave", "Rest Day") or not shift_start:
         return status, 0, 0, 0
     if not time_in:
         return status, 0, 0, 0
-    grace, block = setting("grace_min"), setting("ot_block_min")
     s, e = shift_window(day, shift_start, shift_end)
     tin = closest_dt(day, time_in, s)
+    tout = closest_dt(day, time_out, e) if time_out else None
+    return attendance_from_times(s, e, tin, tout, status)
+
+
+def attendance_from_times(s, e, tin, tout, status=""):
+    """Late / undertime / rendered OT from full datetimes (shift s-e, logged tin-tout)."""
+    grace, block = setting("grace_min"), setting("ot_block_min")
     late = mins(tin - s) if tin > s + dt.timedelta(minutes=grace) else 0
     ut = ot = 0
-    if time_out:
-        tout = closest_dt(day, time_out, e)
+    if tin < s:  # came in early (e.g. approved pre-shift OT)
+        ot += int(mins(s - tin) // block * block)
+    if tout is not None:
         if tout < e:
             ut = mins(e - tout)
         elif tout > e:
-            ot = int(mins(tout - e) // block * block)
+            ot += int(mins(tout - e) // block * block)
     if status in ("", None, "Present", "Late", "Undertime"):
         status = "Late" if late else ("Undertime" if ut else "Present")
     return status, late, ut, ot
+
+
+def save_attendance(agent_id, date, time_in, time_out, status, late, ut, ot, remarks=None,
+                    break_min=None, overbreak_min=None):
+    """Insert or update one attendance row. Break columns are only touched when given (clock data is kept)."""
+    cols = dict(time_in=time_in or None, time_out=time_out or None, status=status, late_min=late,
+                undertime_min=ut, ot_min=ot, remarks=remarks)
+    if break_min is not None:
+        cols.update(break_min=break_min, overbreak_min=overbreak_min or 0)
+    names = ",".join(cols)
+    ex(f"INSERT INTO attendance(agent_id,date,{names}) VALUES(?,?,{','.join('?' * len(cols))}) "
+       f"ON CONFLICT(agent_id,date) DO UPDATE SET " + ",".join(f"{k}=excluded.{k}" for k in cols),
+       (agent_id, str(date), *cols.values()))
 
 
 def working_days(rest_days, start, end):
@@ -601,7 +748,9 @@ def cell_label(r):
 
 def page_dashboard(acct):
     st.header("📊 Daily Dashboard")
-    day = st.date_input("Date", dt.date.today(), key="dash_day")
+    if mark_no_shows():
+        flush_to_sheet()
+    day = st.date_input("Date", today_site(), key="dash_day")
     sch = build_schedule(day, day, acct)
     if sch.empty:
         st.info("No agents yet. Add your roster under **Roster & Accounts**, or load sample data in **Settings**.")
@@ -679,7 +828,7 @@ def page_dashboard(acct):
 
 def page_schedule(acct):
     st.header("🗓️ Schedules")
-    pick = st.date_input("Week of", dt.date.today(), key="sched_week")
+    pick = st.date_input("Week of", today_site(), key="sched_week")
     w0 = week_start(pick)
     sch = build_schedule(w0, w0 + 6 * ONE_DAY, acct)
     if sch.empty:
@@ -761,8 +910,18 @@ def page_schedule(acct):
 
 
 def page_attendance(acct):
-    st.header("⏱️ Daily Attendance")
-    day = st.date_input("Shift date (the date the shift starts)", dt.date.today(), key="att_day")
+    st.header("⏱️ Attendance")
+    if mark_no_shows():
+        flush_to_sheet()
+    t_sheet, t_logs = st.tabs(["Daily sheet", "Clock logs"])
+    with t_logs:
+        page_clock_logs(acct)
+    with t_sheet:
+        _attendance_sheet(acct)
+
+
+def _attendance_sheet(acct):
+    day = st.date_input("Shift date (the date the shift starts)", today_site(), key="att_day")
     sch = build_schedule(day, day, acct)
     show_rd = st.toggle("Include rest days", False)
     if not show_rd:
@@ -778,13 +937,16 @@ def page_attendance(acct):
     for col in ("time_in", "time_out", "remarks"):
         m[col] = m[col].fillna("")
     view = m[["agent_id", "emp_id", "name", "account", "kind", "shift", "time_in", "time_out",
-              "status", "late_min", "undertime_min", "ot_min", "remarks"]]
-    st.caption(f"Grace period: {setting('grace_min'):g} min · OT counted in {setting('ot_block_min'):g}-min blocks. "
-               "Leave status blank to auto-tag Present / Late / Undertime from the time logs.")
+              "status", "late_min", "undertime_min", "break_min", "overbreak_min", "ot_min", "remarks"]]
+    st.caption(f"Filled automatically when agents log in and out. Grace period: {setting('grace_min'):g} min · "
+               f"OT counted in {setting('ot_block_min'):g}-min blocks. You can still type or correct times here "
+               "(leave status blank to auto-tag Present / Late / Undertime); to fix clock events, use **Clock logs**.")
     ed = st.data_editor(
         view, hide_index=True, width="stretch", key=f"att_ed_{day}_{acct}",
-        disabled=["emp_id", "name", "account", "kind", "shift", "late_min", "undertime_min", "ot_min"],
+        disabled=["emp_id", "name", "account", "kind", "shift", "late_min", "undertime_min", "break_min",
+                  "overbreak_min", "ot_min"],
         column_config={
+            "break_min": "Breaks (min)", "overbreak_min": "Over-break (min)",
             "agent_id": None,
             "time_in": st.column_config.TextColumn("Time in", validate=TIME_RE, help="HH:MM, 24h"),
             "time_out": st.column_config.TextColumn("Time out", validate=TIME_RE, help="HH:MM, 24h"),
@@ -800,8 +962,7 @@ def page_attendance(acct):
                 continue
             stt, late, ut, ot = compute_attendance(day, src.shift_start, src.shift_end,
                                                    r.time_in, r.time_out, r.status or "")
-            ex("INSERT OR REPLACE INTO attendance VALUES(?,?,?,?,?,?,?,?,?)",
-               (r.agent_id, str(day), r.time_in or None, r.time_out or None, stt, late, ut, ot, r.remarks))
+            save_attendance(r.agent_id, day, r.time_in, r.time_out, stt, late, ut, ot, r.remarks)
             saved += 1
         st.toast(f"Saved {saved} records")
         rerun()
@@ -809,8 +970,7 @@ def page_attendance(acct):
         for r in ed.itertuples():
             src = m[m.agent_id == r.agent_id].iloc[0]
             if src.kind in WORK_KINDS and not r.status and not r.time_in:
-                ex("INSERT OR REPLACE INTO attendance VALUES(?,?,?,?,?,?,?,?,?)",
-                   (r.agent_id, str(day), src.shift_start, src.shift_end, "Present", 0, 0, 0, r.remarks))
+                save_attendance(r.agent_id, day, src.shift_start, src.shift_end, "Present", 0, 0, 0, r.remarks)
         rerun()
 
 
@@ -827,8 +987,8 @@ def page_leaves(acct):
             arow = ag[ag.id == aid].iloc[0]
             c = st.columns(3)
             ltype = c[0].selectbox("Type", LEAVE_TYPES)
-            d1 = c[1].date_input("From", dt.date.today() + ONE_DAY, key="lv_d1")
-            d2 = c[2].date_input("To", dt.date.today() + ONE_DAY, key="lv_d2")
+            d1 = c[1].date_input("From", today_site() + ONE_DAY, key="lv_d1")
+            d2 = c[2].date_input("To", today_site() + ONE_DAY, key="lv_d2")
             reason = st.text_input("Reason")
             if d2 >= d1:
                 days = working_days(arow.rest_days, d1, d2)
@@ -847,7 +1007,7 @@ def page_leaves(acct):
                 else:
                     ex("INSERT INTO leaves(agent_id,leave_type,start_date,end_date,days,status,reason,filed_on) "
                        "VALUES(?,?,?,?,?,?,?,?)", (aid, ltype, str(d1), str(d2), days, "Pending", reason,
-                                                   str(dt.date.today())))
+                                                   str(today_site())))
                     st.success("Time off filed — waiting for approval.")
     with t2:
         pend = q("SELECT l.*, a.name, a.account FROM leaves l JOIN agents a ON a.id=l.agent_id "
@@ -874,8 +1034,8 @@ def page_leaves(acct):
                     rerun()
     with t3:
         c = st.columns(2)
-        f1 = c[0].date_input("From", dt.date.today() - dt.timedelta(days=7), key="lc1")
-        f2 = c[1].date_input("To", dt.date.today() + dt.timedelta(days=30), key="lc2")
+        f1 = c[0].date_input("From", today_site() - dt.timedelta(days=7), key="lc1")
+        f2 = c[1].date_input("To", today_site() + dt.timedelta(days=30), key="lc2")
         allv = q("SELECT l.id, a.name, a.account, l.leave_type, l.start_date, l.end_date, l.days, l.status, "
                  "l.reason, l.decided_by FROM leaves l JOIN agents a ON a.id=l.agent_id "
                  "WHERE l.start_date<=? AND l.end_date>=? ORDER BY l.start_date", (str(f2), str(f1)))
@@ -890,8 +1050,8 @@ def page_leaves(acct):
             rerun()
     with t4:
         c = st.columns(2)
-        s1 = c[0].date_input("From", dt.date.today().replace(month=1, day=1), key="lvs1")
-        s2 = c[1].date_input("To", dt.date.today().replace(month=12, day=31), key="lvs2")
+        s1 = c[0].date_input("From", today_site().replace(month=1, day=1), key="lvs1")
+        s2 = c[1].date_input("To", today_site().replace(month=12, day=31), key="lvs2")
         used = q("SELECT agent_id, leave_type, SUM(days) d FROM leaves WHERE status='Approved' "
                  "AND start_date<=? AND end_date>=? GROUP BY agent_id, leave_type", (str(s2), str(s1)))
         summ = ag[["id", "emp_id", "name", "account"]].merge(
@@ -906,7 +1066,7 @@ def page_leaves(acct):
 
 def page_coverage(acct):
     st.header("🧩 Coverage Finder")
-    day = st.date_input("Date needing coverage", dt.date.today(), key="cov_day")
+    day = st.date_input("Date needing coverage", today_site(), key="cov_day")
     gaps = open_gaps(day, acct)
     accts = account_names()
     if not accts:
@@ -959,7 +1119,7 @@ def page_coverage(acct):
         ex("INSERT INTO ot_requests(agent_id,date,ot_type,start_time,end_time,hours,reason,status,covering_for,filed_on) "
            "VALUES(?,?,?,?,?,?,?,?,?,?)", (cid, str(day), "Coverage OT", ns, ne, hrs,
                                           f"{row.cover_type} covering {pre['label']} ({account})", "Approved",
-                                          pre["for"], str(dt.date.today())))
+                                          pre["for"], str(today_site())))
         if row.cover_type == "Rest Day OT":
             ex("INSERT OR REPLACE INTO schedule_overrides VALUES(?,?,?,?,?,?)",
                (cid, str(day), "Work (RD OT)", ns, ne, f"Covering {pre['label']}"))
@@ -977,7 +1137,7 @@ def page_ot(acct):
             with st.form("ot"):
                 aid = st.selectbox("Agent", list(labels), format_func=labels.get)
                 c = st.columns(4)
-                d = c[0].date_input("Date", dt.date.today())
+                d = c[0].date_input("Date", today_site())
                 typ = c[1].selectbox("Type", OT_TYPES)
                 s = c[2].text_input("From (HH:MM)", "07:00")
                 e = c[3].text_input("To (HH:MM)", "09:00")
@@ -990,12 +1150,12 @@ def page_ot(acct):
                         ex("INSERT INTO ot_requests(agent_id,date,ot_type,start_time,end_time,hours,reason,status,filed_on) "
                            "VALUES(?,?,?,?,?,?,?,?,?)", (aid, str(d), typ, s, e,
                                                          round((we - ws).total_seconds() / 3600, 2), reason,
-                                                         "Pending", str(dt.date.today())))
+                                                         "Pending", str(today_site())))
                         st.success("OT filed.")
     with t2:
         c = st.columns(2)
-        f1 = c[0].date_input("From", week_start(dt.date.today()), key="ot1")
-        f2 = c[1].date_input("To", week_start(dt.date.today()) + 6 * ONE_DAY, key="ot2")
+        f1 = c[0].date_input("From", week_start(today_site()), key="ot1")
+        f2 = c[1].date_input("To", week_start(today_site()) + 6 * ONE_DAY, key="ot2")
         log = q("SELECT o.id, a.name, a.account, o.date, o.ot_type, o.start_time, o.end_time, o.hours, "
                 "o.reason, o.status FROM ot_requests o JOIN agents a ON a.id=o.agent_id "
                 "WHERE o.date BETWEEN ? AND ? ORDER BY o.date", (str(f1), str(f2)))
@@ -1010,7 +1170,7 @@ def page_ot(acct):
                 ex("UPDATE ot_requests SET status=? WHERE id=?", (r.status, r.id))
             rerun()
     with t3:
-        d = st.date_input("Week of", dt.date.today(), key="otw")
+        d = st.date_input("Week of", today_site(), key="otw")
         otw = weekly_ot(d)
         w0 = week_start(d)
         rend = q("SELECT agent_id, SUM(ot_min)/60.0 h FROM attendance WHERE date BETWEEN ? AND ? GROUP BY agent_id",
@@ -1030,8 +1190,8 @@ def page_ot(acct):
 def page_reports(acct):
     st.header("📈 Reports")
     c = st.columns(2)
-    d1 = c[0].date_input("From", dt.date.today().replace(day=1), key="r1")
-    d2 = c[1].date_input("To", dt.date.today(), key="r2")
+    d1 = c[0].date_input("From", today_site().replace(day=1), key="r1")
+    d2 = c[1].date_input("To", today_site(), key="r2")
     sch = build_schedule(d1, d2, acct)
     if sch.empty:
         st.info("No data.")
@@ -1049,6 +1209,8 @@ def page_reports(acct):
         "absent": g.apply(lambda x: int((x.status == "Absent").sum())),
         "ncns": g.apply(lambda x: int((x.status == "NCNS").sum())),
         "undertime_min": g.apply(lambda x: int(x.undertime_min.fillna(0).sum())),
+        "break_min": g.apply(lambda x: int(pd.to_numeric(x.break_min, errors="coerce").fillna(0).sum())),
+        "overbreak_min": g.apply(lambda x: int(pd.to_numeric(x.overbreak_min, errors="coerce").fillna(0).sum())),
         "rendered_ot_hrs": g.apply(lambda x: round(x.ot_min.fillna(0).sum() / 60, 2)),
         "leave_days": g.apply(lambda x: int((x.kind == "Leave").sum())),
         "agent_id": g.agent_id.first(),
@@ -1067,7 +1229,8 @@ def page_reports(acct):
     st.dataframe(rep, hide_index=True, width="stretch")
     st.download_button("⬇️ Agent summary (CSV)", rep.to_csv(index=False), f"agent_summary_{d1}_{d2}.csv")
     raw = m[m.status.notna()][["date", "emp_id", "name", "account", "shift_start", "shift_end", "time_in",
-                              "time_out", "status", "late_min", "undertime_min", "ot_min", "remarks"]]
+                              "time_out", "status", "late_min", "undertime_min", "break_min", "overbreak_min",
+                              "ot_min", "remarks"]]
     st.download_button("⬇️ Raw attendance log (CSV)", raw.to_csv(index=False), f"attendance_{d1}_{d2}.csv")
     st.subheader("Top tardiness")
     st.bar_chart(rep.set_index("name").late_min_total.sort_values(ascending=False).head(15))
@@ -1194,7 +1357,7 @@ def load_sample_data():
                (str(emp), f"{rnd.choice(first)} {rnd.choice(last)}", acc, lob, f"TL {rnd.choice(last)}", sk,
                 ss, se, rest_patterns[i % len(rest_patterns)], 12, 12))
             emp += 1
-    today = dt.date.today()
+    today = today_site()
     ag = agents_df(True)
     picks = ag.sample(4, random_state=3)
     for k, r in enumerate(picks.itertuples()):
@@ -1220,8 +1383,7 @@ def load_sample_data():
             tout = (e + dt.timedelta(minutes=extra + rnd.randint(0, 9))).strftime("%H:%M")
             stt = ""
         stt, lm, ut, ot = compute_attendance(d, r.shift_start, r.shift_end, tin, tout, stt)
-        ex("INSERT OR REPLACE INTO attendance VALUES(?,?,?,?,?,?,?,?,?)",
-           (r.agent_id, r.date, tin, tout, stt, lm, ut, ot, ""))
+        save_attendance(r.agent_id, r.date, tin, tout, stt, lm, ut, ot, "")
         if ot:
             ex("INSERT INTO ot_requests(agent_id,date,ot_type,start_time,end_time,hours,reason,status,filed_on) "
                "VALUES(?,?,?,?,?,?,?,?,?)", (r.agent_id, r.date, "Post-shift OT", r.shift_end, tout,
@@ -1259,6 +1421,17 @@ def page_settings():
         vals["ot_min_eff_pct"] = c[3].number_input("Min % of block in short intervals", 10.0, 100.0,
                                                    setting("ot_min_eff_pct"), step=5.0,
                                                    help="Higher = less OT spent in intervals that are already covered")
+        st.markdown("**Time clock**")
+        c = st.columns(6)
+        vals["break_min"] = c[0].number_input("Break length (min)", 1.0, 120.0, setting("break_min"), step=5.0)
+        vals["breaks_allowed"] = c[1].number_input("Breaks per shift", 0.0, 10.0, setting("breaks_allowed"), step=1.0)
+        vals["lunch_min"] = c[2].number_input("Lunch length (min)", 1.0, 180.0, setting("lunch_min"), step=5.0)
+        vals["lunches_allowed"] = c[3].number_input("Lunches per shift", 0.0, 3.0, setting("lunches_allowed"),
+                                                    step=1.0)
+        vals["login_early_hrs"] = c[4].number_input("Can log in up to (h) early", 0.5, 8.0,
+                                                    setting("login_early_hrs"), step=0.5)
+        vals["auto_absent"] = 1.0 if c[5].toggle("Auto-mark no-shows Absent", bool(int(setting("auto_absent"))),
+                                                 help="Only for agents who have a login") else 0.0
         if st.form_submit_button("Save settings"):
             for k, v in vals.items():
                 ex("INSERT OR REPLACE INTO settings VALUES(?,?)", (k, str(v)))
@@ -1271,7 +1444,7 @@ def page_settings():
         st.caption("Download a backup regularly — especially on Streamlit Community Cloud, where the app's "
                    "disk is wiped whenever it restarts or redeploys. Connect Google Sheets (see README) to avoid this.")
     with open(DB_PATH, "rb") as f:
-        st.download_button("⬇️ Download database backup", f.read(), f"wfm_backup_{dt.date.today()}.db")
+        st.download_button("⬇️ Download database backup", f.read(), f"wfm_backup_{today_site()}.db")
     up = st.file_uploader("Restore from backup (.db)", type=["db", "sqlite"])
     if up is not None and st.button("Restore (replaces all current data)"):
         data = up.getvalue()
@@ -1290,10 +1463,13 @@ def page_settings():
         load_sample_data()
         st.success("Sample data loaded — check the Dashboard.")
     with st.expander("Danger zone"):
-        if st.checkbox("I understand this deletes everything") and st.button("Wipe all data"):
-            for t in ("attendance", "leaves", "ot_requests", "schedule_overrides", "agents", "accounts", "interval_volume"):
+        if st.checkbox("I understand this deletes everything except admin logins") and st.button("Wipe all data"):
+            for t in ("attendance", "leaves", "ot_requests", "schedule_overrides", "agents", "accounts", "interval_volume",
+                      "time_logs"):
                 ex(f"DELETE FROM {t}")
-            st.success("All data deleted.")
+            ex("DELETE FROM users WHERE role='agent'")  # agent logins point at roster rows that are now gone
+            st.success("All data deleted. Admin logins were kept; agent logins were removed — recreate them under "
+                       "**Users** after importing your roster.")
 
 
 # ----------------------------------------------------------------- interval planner
@@ -1644,7 +1820,7 @@ def normalize_volume(df, source_tz, site_tz, default_aht):
 
 def sample_interval_volume(rnd):
     """8 weeks of realistic-looking history in site time for the demo accounts."""
-    today = dt.date.today()
+    today = today_site()
     profiles = {  # (peak hour in site time, spread h, contacts at peak per 30 min)
         "Telco Inbound": dict(peaks=[(26.5, 2.6, 15)], base=0.0, aht=330, weekend=0.6),
         "E-commerce Chat": dict(peaks=[(26.0, 2.4, 8), (11.5, 2.0, 6)], base=0.0, aht=540, weekend=1.0),
@@ -1688,7 +1864,7 @@ def page_interval(acct):
         return
     c = st.columns([2, 1.2, 1, 1])
     account = c[0].selectbox("Account", accts, index=accts.index(acct) if acct in accts else 0, key="iv_acc")
-    day = c[1].date_input("Date", dt.date.today(), key="iv_day")
+    day = c[1].date_input("Date", today_site(), key="iv_day")
     adj = c[2].number_input("Volume adj. %", -90.0, 500.0, 0.0, step=5.0,
                             help="Lift or cut the forecast, e.g. +15 for a promo, billing cycle or outage")
     weeks = c[3].number_input("History (weeks)", 1, 26, int(setting("forecast_weeks")), key="iv_weeks")
@@ -1848,7 +2024,7 @@ def page_interval(acct):
                         ex("INSERT INTO ot_requests(agent_id,date,ot_type,start_time,end_time,hours,reason,status,"
                            "filed_on,for_account) VALUES(?,?,?,?,?,?,?,?,?,?)",
                            (r.agent_id, r.shift_date, r.ot_type, r.start, r.end, r.hours,
-                            f"OT plan: short intervals on {day} ({account})", act, str(dt.date.today()), account))
+                            f"OT plan: short intervals on {day} ({account})", act, str(today_site()), account))
                         if act == "Approved" and r.ot_type == "Rest Day OT":
                             ex("INSERT OR IGNORE INTO schedule_overrides VALUES(?,?,?,?,?,?)",
                                (r.agent_id, r.shift_date, "Work (RD OT)", r.start, r.end, "OT plan"))
@@ -1968,8 +2144,824 @@ def page_interval(acct):
                     rerun()
 
 
+# ----------------------------------------------------------------- logins
+PW_ITER = 200_000
+LOCK_AFTER, LOCK_MIN = 5, 10
+CLOCK_EVENTS = {"login": "Log in", "break_start": "Break start", "lunch_start": "Lunch start",
+                "break_end": "Break end", "logout": "Log out"}
+
+
+def hash_pw(pw):
+    salt = os.urandom(16)
+    h = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, PW_ITER)
+    return f"pbkdf2_sha256${PW_ITER}${salt.hex()}${h.hex()}"
+
+
+def check_pw(pw, stored):
+    try:
+        _, it, salt, h = str(stored).split("$")
+        calc = hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt), int(it))
+        return hmac.compare_digest(calc.hex(), h)
+    except Exception:
+        return False
+
+
+def temp_password():
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789"
+    return "".join(secrets.choice(alphabet) for _ in range(8))
+
+
+def pw_problem(pw):
+    if len(pw) < 8:
+        return "Use at least 8 characters."
+    if pw.isalpha() or pw.isdigit():
+        return "Mix letters and numbers."
+    return None
+
+
+def get_user(username):
+    df = q("SELECT * FROM users WHERE lower(username)=lower(?)", (str(username).strip(),))
+    return df.iloc[0].to_dict() if len(df) else None
+
+
+def authenticate(username, pw):
+    u = get_user(username)
+    now = now_site()
+    if u is None:
+        return None, "Wrong username or password."
+    if not int(u.get("active") or 0):
+        return None, "This login is disabled. Please contact your admin."
+    if u.get("locked_until") and str(u["locked_until"]) > now.isoformat():
+        return None, f"Too many wrong attempts. Try again after {str(u['locked_until'])[11:16]}."
+    if not check_pw(pw, u["pw_hash"]):
+        failed = int(u.get("failed") or 0) + 1
+        locked = (now + dt.timedelta(minutes=LOCK_MIN)).isoformat() if failed >= LOCK_AFTER else None
+        ex("UPDATE users SET failed=?, locked_until=? WHERE username=?",
+           (0 if locked else failed, locked, u["username"]))
+        return None, ("Too many wrong attempts — locked for %d minutes." % LOCK_MIN) if locked \
+            else "Wrong username or password."
+    ex("UPDATE users SET failed=0, locked_until=NULL, last_login=? WHERE username=?", (now.isoformat(), u["username"]))
+    return u, None
+
+
+def start_session(u):
+    st.session_state["auth"] = {"username": u["username"], "role": u["role"],
+                                "agent_id": int(u["agent_id"]) if pd.notna(u.get("agent_id")) and
+                                u.get("agent_id") not in (None, "") else None}
+
+
+def logout_session():
+    for k in list(st.session_state.keys()):
+        del st.session_state[k]
+
+
+def auth_gate():
+    """Show the login (or first-admin setup) screen until someone is signed in."""
+    u = current_user()
+    if u:
+        fresh = get_user(u["username"])
+        if fresh is None or not int(fresh.get("active") or 0):
+            logout_session()
+            st.rerun()
+        u["role"] = fresh["role"]
+        if int(fresh.get("must_change") or 0):
+            page_change_password(forced=True)
+            st.stop()
+        return
+    n_admins = int(q("SELECT COUNT(*) n FROM users WHERE role='admin'").n[0])
+    _, mid, _ = st.columns([1, 1.3, 1])
+    with mid:
+        st.title("🗓️ WFM Scheduler")
+        if n_admins == 0:
+            st.subheader("First-time setup: create the admin login")
+            st.caption("No admin exists yet. Create the first admin now, then add other admins and agent logins "
+                       "under **Users**.")
+            try:
+                setup_code = str(st.secrets.get("setup_code") or "")
+            except Exception:  # no secrets file at all
+                setup_code = ""
+            code_needed = bool(setup_code)
+            with st.form("setup"):
+                un = st.text_input("Admin username")
+                pw = st.text_input("Password", type="password")
+                pw2 = st.text_input("Repeat password", type="password")
+                code = st.text_input("Setup code (from your app secrets)", type="password") if code_needed else ""
+                if st.form_submit_button("Create admin", type="primary"):
+                    prob = pw_problem(pw)
+                    if code_needed and not hmac.compare_digest(code, setup_code):
+                        st.error("Wrong setup code.")
+                    elif not un.strip():
+                        st.error("Enter a username.")
+                    elif prob:
+                        st.error(prob)
+                    elif pw != pw2:
+                        st.error("Passwords don't match.")
+                    elif int(q("SELECT COUNT(*) n FROM users WHERE role='admin'").n[0]):
+                        st.error("An admin was just created. Please sign in.")
+                    else:
+                        ex("INSERT INTO users(username,pw_hash,role,active,must_change,created_on) VALUES(?,?,?,?,?,?)",
+                           (un.strip(), hash_pw(pw), "admin", 1, 0, now_site().isoformat()))
+                        flush_to_sheet(sync=True)
+                        start_session(get_user(un.strip()))
+                        st.rerun()
+        else:
+            with st.form("login"):
+                un = st.text_input("Username")
+                pw = st.text_input("Password", type="password")
+                if st.form_submit_button("Sign in", type="primary", width="stretch"):
+                    user, err = authenticate(un, pw)
+                    if err:
+                        st.error(err)
+                    else:
+                        start_session(user)
+                        st.rerun()
+            st.caption("Forgot your password? Ask an admin to reset it.")
+    st.stop()
+
+
+def page_change_password(forced=False):
+    u = current_user()
+    _, mid, _ = st.columns([1, 1.3, 1]) if forced else (None, st.container(), None)
+    with mid:
+        st.subheader("🔑 Set a new password" if forced else "🔑 Change password")
+        if forced:
+            st.caption("You're using a temporary password. Please choose your own to continue.")
+        with st.form("chpw"):
+            old = st.text_input("Current password", type="password")
+            pw = st.text_input("New password", type="password", help="At least 8 characters, letters and numbers")
+            pw2 = st.text_input("Repeat new password", type="password")
+            if st.form_submit_button("Save password", type="primary"):
+                me = get_user(u["username"])
+                prob = pw_problem(pw)
+                if not check_pw(old, me["pw_hash"]):
+                    st.error("Current password is wrong.")
+                elif prob:
+                    st.error(prob)
+                elif pw != pw2:
+                    st.error("New passwords don't match.")
+                elif pw == old:
+                    st.error("Choose a password different from the current one.")
+                else:
+                    ex("UPDATE users SET pw_hash=?, must_change=0 WHERE username=?", (hash_pw(pw), me["username"]))
+                    flush_to_sheet(sync=True)
+                    st.success("Password saved.")
+                    if forced:
+                        st.rerun()
+        if forced and st.button("Sign out"):
+            logout_session()
+            st.rerun()
+
+
+# ----------------------------------------------------------------- time clock
+def agent_row(agent_id):
+    df = q("SELECT * FROM agents WHERE id=?", (agent_id,))
+    return df.iloc[0] if len(df) else None
+
+
+def _dt(s):
+    return dt.datetime.fromisoformat(str(s))
+
+
+def agent_shift_windows(agent_id, d1, d2):
+    """Work windows (with login-open time) for one agent's shifts starting d1..d2."""
+    sch = build_schedule(d1, d2)
+    sch = sch[(sch.agent_id == agent_id) & sch.kind.isin(WORK_KINDS)]
+    ot = q("SELECT date, start_time, end_time FROM ot_requests WHERE agent_id=? AND status='Approved' "
+           "AND date BETWEEN ? AND ?", (agent_id, str(d1), str(d2)))
+    early = dt.timedelta(hours=setting("login_early_hrs"))
+    out = []
+    for r in sch.itertuples():
+        d = dt.date.fromisoformat(r.date)
+        s, e = shift_window(d, r.shift_start, r.shift_end)
+        opens = s - early
+        for o in ot[ot.date == r.date].itertuples():
+            if o.start_time and o.end_time:
+                os_, oe = place_ot(d, o.start_time, o.end_time, (s, e))
+                if oe <= s:  # approved pre-shift OT: allow logging in for it
+                    opens = min(opens, os_ - dt.timedelta(minutes=30))
+        out.append(dict(shift_date=r.date, kind=r.kind, start=s, end=e, opens=opens,
+                        label=f"{r.shift_start}–{r.shift_end}"))
+    return out
+
+
+def resolve_shift(agent_id, now):
+    """Which shift a log-in at `now` belongs to (handles graveyard shifts and early OT log-ins)."""
+    wins = [w for w in agent_shift_windows(agent_id, now.date() - ONE_DAY, now.date() + ONE_DAY)
+            if w["opens"] <= now <= w["end"]]
+    if not wins:
+        return None
+    return min(wins, key=lambda w: abs((w["start"] - now).total_seconds()))
+
+
+def clock_state(agent_id, now=None):
+    """Current state from the most recent clock event: out / in / break / lunch."""
+    now = now or now_site()
+    df = q("SELECT * FROM time_logs WHERE agent_id=? AND ts>=? ORDER BY ts, id",
+           (agent_id, (now - dt.timedelta(hours=30)).isoformat()))
+    if df.empty or df.iloc[-1].event == "logout":
+        return dict(state="out", shift_date=None, since=None)
+    last = df.iloc[-1]
+    shift_date = last.shift_date
+    sess = df[df.shift_date == shift_date]
+    login_ts = _dt(sess[sess.event == "login"].ts.iloc[-1]) if (sess.event == "login").any() else _dt(last.ts)
+    # an open session goes stale if the shift ended long ago (forgot to log out)
+    wins = [w for w in agent_shift_windows(agent_id, dt.date.fromisoformat(shift_date),
+                                           dt.date.fromisoformat(shift_date)) if w["shift_date"] == shift_date]
+    end = wins[0]["end"] if wins else login_ts + dt.timedelta(hours=setting("max_daily_hrs"))
+    if now > end + dt.timedelta(hours=4):
+        return dict(state="out", shift_date=None, since=None, stale=shift_date)
+    state = {"break_start": "break", "lunch_start": "lunch"}.get(last.event, "in")
+    return dict(state=state, shift_date=shift_date, since=_dt(last.ts), login=login_ts)
+
+
+def break_summary(events, now=None):
+    """Totals per break type from a shift's events; ongoing break counted to `now` when given."""
+    allowed = {"break": (setting("break_min"), int(setting("breaks_allowed"))),
+               "lunch": (setting("lunch_min"), int(setting("lunches_allowed")))}
+    used = {"break": [], "lunch": []}
+    open_kind, open_ts = None, None
+    for ev, ts in events:
+        if ev in ("break_start", "lunch_start"):
+            if open_kind:
+                used[open_kind].append(mins(ts - open_ts))
+            open_kind, open_ts = ev.split("_")[0], ts
+        elif ev in ("break_end", "logout", "login") and open_kind:
+            used[open_kind].append(mins(ts - open_ts))
+            open_kind = None
+    ongoing = None
+    if open_kind and now is not None:
+        ongoing = (open_kind, mins(now - open_ts))
+        used[open_kind].append(ongoing[1])
+    total = sum(sum(v) for v in used.values())
+    over = 0
+    for kind, durs in used.items():
+        lim, count = allowed[kind]
+        for i, d in enumerate(durs):
+            over += d if i >= count else max(0, d - lim)  # extra breaks count in full
+    return dict(total=total, over=int(over), used=used, ongoing=ongoing, allowed=allowed)
+
+
+def rebuild_attendance(agent_id, shift_date):
+    """Recalculate one attendance row from the clock logs of that shift."""
+    logs = q("SELECT event, ts FROM time_logs WHERE agent_id=? AND shift_date=? ORDER BY ts, id",
+             (agent_id, str(shift_date)))
+    if logs.empty:
+        return
+    events = [(e, _dt(t)) for e, t in zip(logs.event, logs.ts)]
+    logins = [t for e, t in events if e == "login"]
+    if not logins:
+        return
+    tin = logins[0]
+    tout = events[-1][1] if events[-1][0] == "logout" else None
+    wins = [w for w in agent_shift_windows(agent_id, dt.date.fromisoformat(str(shift_date)),
+                                           dt.date.fromisoformat(str(shift_date)))]
+    prev = q("SELECT status, remarks FROM attendance WHERE agent_id=? AND date=?", (agent_id, str(shift_date)))
+    remarks = prev.remarks.iloc[0] if len(prev) and isinstance(prev.remarks.iloc[0], str) else ""
+    remarks = remarks.replace("Auto: no log in", "").replace("No log out", "").strip(" ;")
+    if wins:
+        stt, late, ut, ot = attendance_from_times(wins[0]["start"], wins[0]["end"], tin, tout)
+    else:
+        stt, late, ut, ot = "Unscheduled", 0, 0, 0
+    b = break_summary(events)
+    save_attendance(agent_id, shift_date, tin.strftime("%H:%M"), tout.strftime("%H:%M") if tout else None,
+                    stt, late, ut, ot, remarks, break_min=b["total"], overbreak_min=b["over"])
+
+
+def clock_action(agent_id, action, now=None):
+    """Record a clock event for an agent. Returns (ok, message)."""
+    now = now or now_site()
+    stc = clock_state(agent_id, now)
+    if stc.get("stale"):  # forgot to log out last shift: flag it, then carry on
+        prev = q("SELECT remarks FROM attendance WHERE agent_id=? AND date=?", (agent_id, stc["stale"]))
+        rem = prev.remarks.iloc[0] if len(prev) and isinstance(prev.remarks.iloc[0], str) else ""
+        if "No log out" not in rem:
+            ex("UPDATE attendance SET remarks=? WHERE agent_id=? AND date=?",
+               ((rem + "; No log out").strip("; "), agent_id, stc["stale"]))
+    state = stc["state"]
+
+    def log(event, shift_date, ts=now):
+        ex("INSERT INTO time_logs(agent_id,shift_date,event,ts,source) VALUES(?,?,?,?,?)",
+           (agent_id, str(shift_date), event, ts.isoformat(), "clock"))
+
+    if action == "login":
+        if state != "out":
+            return False, "You're already logged in."
+        w = resolve_shift(agent_id, now)
+        shift_date = w["shift_date"] if w else str(now.date())
+        before = q("SELECT MIN(ts) t FROM time_logs WHERE agent_id=? AND shift_date=? AND event='login'",
+                   (agent_id, shift_date)).t.iloc[0]
+        log("login", shift_date)
+        rebuild_attendance(agent_id, shift_date)
+        if before:
+            return True, f"Logged back in. Your first log in at {_dt(before):%H:%M} still counts for this shift."
+        if not w:
+            return True, "Logged in. You have no shift scheduled right now, so this is recorded as unscheduled."
+        late = mins(now - w["start"])
+        if late > setting("grace_min"):
+            return True, f"Logged in for your {w['label']} shift — {late} min late."
+        return True, f"Logged in for your {w['label']} shift. Have a good one!"
+    if state == "out":
+        return False, "You're not logged in."
+    sd = stc["shift_date"]
+    if action in ("break_start", "lunch_start"):
+        if state != "in":
+            return False, "End your current break first."
+        log(action, sd)
+        rebuild_attendance(agent_id, sd)
+        return True, "Enjoy your " + ("lunch." if action == "lunch_start" else "break.")
+    if action == "break_end":
+        if state not in ("break", "lunch"):
+            return False, "You're not on a break."
+        log("break_end", sd)
+        rebuild_attendance(agent_id, sd)
+        return True, "Welcome back."
+    if action == "logout":
+        if state in ("break", "lunch"):
+            log("break_end", sd)
+        log("logout", sd)
+        rebuild_attendance(agent_id, sd)
+        return True, "Logged out. Thanks for today!"
+    return False, "Unknown action."
+
+
+def mark_no_shows(now=None):
+    """Mark agents who have a login as Absent when their shift ended and they never logged in."""
+    if not int(setting("auto_absent")):
+        return 0
+    now = now or now_site()
+    users = q("SELECT agent_id, created_on FROM users WHERE role='agent' AND active=1 AND agent_id IS NOT NULL")
+    if users.empty:
+        return 0
+    since = {int(float(a)): str(c or "")[:10] for a, c in zip(users.agent_id, users.created_on)}
+    d1, d2 = now.date() - 2 * ONE_DAY, now.date()
+    sch = build_schedule(d1, d2)
+    sch = sch[sch.agent_id.isin(since) & sch.kind.isin(WORK_KINDS)]
+    logged = {(int(a), d) for a, d in q("SELECT DISTINCT agent_id, shift_date FROM time_logs WHERE shift_date>=?",
+                                        (str(d1),)).itertuples(index=False)}
+    have = {(int(a), d) for a, d in q("SELECT agent_id, date FROM attendance WHERE date>=?",
+                                      (str(d1),)).itertuples(index=False)}
+    n = 0
+    for r in sch.itertuples():
+        if r.date < since[r.agent_id] or (r.agent_id, r.date) in logged or (r.agent_id, r.date) in have:
+            continue
+        _, e = shift_window(dt.date.fromisoformat(r.date), r.shift_start, r.shift_end)
+        if now > e + dt.timedelta(hours=1):
+            save_attendance(r.agent_id, r.date, None, None, "Absent", 0, 0, 0, "Auto: no log in")
+            n += 1
+    return n
+
+
+# ----------------------------------------------------------------- agent pages
+def _fmt_dur(m):
+    m = int(max(0, m))
+    return f"{m // 60}h {m % 60:02d}m" if m >= 60 else f"{m}m"
+
+
+def page_my_shift():
+    u = current_user()
+    aid = u.get("agent_id")
+    ag = agent_row(aid) if aid is not None else None
+    if ag is None:
+        st.error("Your login isn't linked to an agent on the roster. Please contact your admin.")
+        return
+    st.header(f"🕒 Hi, {str(ag['name']).split()[0]}!")
+    _clock_panel(int(aid))
+
+    st.subheader("My schedule — next 7 days")
+    today = today_site()
+    sch = build_schedule(today, today + 6 * ONE_DAY)
+    mine = sch[sch.agent_id == int(aid)].copy()
+    if len(mine):
+        mine["day"] = [f"{dt.date.fromisoformat(d):%a %b %d}" for d in mine.date]
+        mine["schedule"] = [cell_label(r) if r.kind != "Leave" else f"Time off ({r.note})" for r in mine.itertuples()]
+        st.dataframe(mine[["day", "schedule"]], hide_index=True, width="stretch")
+    st.subheader("My recent attendance")
+    att = q("SELECT date, time_in, time_out, status, late_min, undertime_min, break_min, overbreak_min, ot_min, "
+            "remarks FROM attendance WHERE agent_id=? AND date>=? ORDER BY date DESC",
+            (int(aid), str(today - dt.timedelta(days=14))))
+    if att.empty:
+        st.caption("Nothing yet.")
+    else:
+        st.dataframe(att, hide_index=True, width="stretch", column_config={
+            "late_min": "Late (min)", "undertime_min": "UT (min)", "break_min": "Breaks (min)",
+            "overbreak_min": "Over-break (min)", "ot_min": "OT (min)"})
+
+
+@st.fragment(run_every="30s")
+def _clock_panel(aid):
+    now = now_site()
+    stc = clock_state(aid, now)
+    state = stc["state"]
+    w = resolve_shift(aid, now) if state == "out" else None
+    with st.container(border=True):
+        c = st.columns([2, 1])
+        with c[0]:
+            st.caption(f"{now:%A, %B %d · %H:%M} ({setting_str('site_tz')})")
+            if state == "out":
+                if w:
+                    late = mins(now - w["start"])
+                    st.markdown(f"### Your shift: **{w['label']}**")
+                    if late > 0:
+                        st.warning(f"Your shift started {_fmt_dur(late)} ago — please log in.")
+                    else:
+                        st.info(f"Starts in {_fmt_dur(-late)}.")
+                else:
+                    nxt = [x for x in agent_shift_windows(aid, now.date(), now.date() + 7 * ONE_DAY)
+                           if x["start"] > now]
+                    st.markdown("### You're logged out")
+                    if nxt:
+                        st.caption(f"Next shift: {nxt[0]['start']:%a %b %d} · {nxt[0]['label']}")
+            else:
+                logs = q("SELECT event, ts FROM time_logs WHERE agent_id=? AND shift_date=? ORDER BY ts, id",
+                         (aid, stc["shift_date"]))
+                b = break_summary([(e, _dt(t)) for e, t in zip(logs.event, logs.ts)], now)
+                label = {"in": "🟢 Working", "break": "☕ On break", "lunch": "🍱 On lunch"}[state]
+                st.markdown(f"### {label}")
+                st.caption(f"Logged in at {stc['login']:%H:%M} · shift date {stc['shift_date']} · "
+                           f"worked {_fmt_dur(mins(now - stc['login']))}")
+                if b["ongoing"]:
+                    kind, m = b["ongoing"]
+                    lim = b["allowed"][kind][0]
+                    msg = f"{kind.title()} running for **{m} min** (allowed {lim:g})"
+                    (st.error if m > lim else st.info)(msg + (" — please end it now." if m > lim else ""))
+                used_b, used_l = b["used"]["break"], b["used"]["lunch"]
+                st.caption(f"Breaks used: {len(used_b)}/{b['allowed']['break'][1]} · "
+                           f"Lunch used: {len(used_l)}/{b['allowed']['lunch'][1]} · over-break so far: {b['over']} min")
+        with c[1]:
+            acts = {"out": [("login", "▶️ Log in", "primary")],
+                    "in": [("break_start", "☕ Start break", "secondary"), ("lunch_start", "🍱 Start lunch", "secondary"),
+                           ("logout", "⏹️ Log out", "primary")],
+                    "break": [("break_end", "✅ End break", "primary"), ("logout", "⏹️ Log out", "secondary")],
+                    "lunch": [("break_end", "✅ End lunch", "primary"), ("logout", "⏹️ Log out", "secondary")]}[state]
+            for act, lbl, kind in acts:
+                if st.button(lbl, key=f"clk_{act}", type=kind, width="stretch"):
+                    ok, msg = clock_action(aid, act)
+                    st.session_state["clock_msg"] = (ok, msg)
+                    st.rerun()
+            if st.session_state.get("clock_msg"):
+                ok, msg = st.session_state.pop("clock_msg")
+                (st.success if ok else st.error)(msg)
+
+
+def page_my_requests():
+    u = current_user()
+    aid = u.get("agent_id")
+    ag = agent_row(aid) if aid is not None else None
+    if ag is None:
+        st.error("Your login isn't linked to an agent on the roster. Please contact your admin.")
+        return
+    aid = int(aid)
+    st.header("📝 My Requests")
+    t1, t2, t3 = st.tabs(["File time off", "File OT", "My requests"])
+    with t1:
+        with st.form("my_leave"):
+            c = st.columns(3)
+            ltype = c[0].selectbox("Type", LEAVE_TYPES)
+            d1 = c[1].date_input("From", today_site() + ONE_DAY)
+            d2 = c[2].date_input("To", today_site() + ONE_DAY)
+            reason = st.text_input("Reason")
+            if st.form_submit_button("Submit time off", type="primary"):
+                clash = q("SELECT id FROM leaves WHERE agent_id=? AND status IN ('Pending','Approved') "
+                          "AND start_date<=? AND end_date>=?", (aid, str(d2), str(d1)))
+                if d2 < d1:
+                    st.error("End date is before start date.")
+                elif d1 < today_site() and ltype.startswith("Planned"):
+                    st.error("Planned time off must be in the future.")
+                elif len(clash):
+                    st.error("You already have time off filed for some of these dates.")
+                else:
+                    days = working_days(ag.rest_days, d1, d2)
+                    ex("INSERT INTO leaves(agent_id,leave_type,start_date,end_date,days,status,reason,filed_on) "
+                       "VALUES(?,?,?,?,?,?,?,?)", (aid, ltype, str(d1), str(d2), days, "Pending", reason,
+                                                   str(today_site())))
+                    st.success(f"Filed {days:g} working day(s) — waiting for approval.")
+    with t2:
+        st.caption("OT is paid only when approved. Times are your site time (24h). For OT after a graveyard "
+                   "shift, use the date your shift started.")
+        with st.form("my_ot"):
+            c = st.columns(4)
+            d = c[0].date_input("Shift date", today_site())
+            typ = c[1].selectbox("Type", ["Pre-shift OT", "Post-shift OT", "Rest Day OT"])
+            s_ = c[2].text_input("From (HH:MM)", "07:00")
+            e_ = c[3].text_input("To (HH:MM)", "09:00")
+            reason = st.text_input("Reason")
+            if st.form_submit_button("Submit OT", type="primary"):
+                if not (re.fullmatch(TIME_RE, s_) and re.fullmatch(TIME_RE, e_) and s_ and e_):
+                    st.error("Times must be HH:MM, e.g. 07:00.")
+                else:
+                    ws, we = shift_window(d, s_, e_)
+                    hrs = round((we - ws).total_seconds() / 3600, 2)
+                    if hrs > setting("max_daily_hrs"):
+                        st.error(f"That's {hrs:g}h — longer than the {setting('max_daily_hrs'):g}h limit.")
+                    else:
+                        ex("INSERT INTO ot_requests(agent_id,date,ot_type,start_time,end_time,hours,reason,status,"
+                           "filed_on,for_account) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                           (aid, str(d), typ, s_, e_, hrs, reason, "Pending", str(today_site()), ag.account))
+                        st.success(f"Filed {hrs:g}h OT — waiting for approval.")
+    with t3:
+        lv = q("SELECT id, leave_type AS type, start_date, end_date, days, status, reason FROM leaves "
+               "WHERE agent_id=? ORDER BY start_date DESC LIMIT 50", (aid,))
+        ot = q("SELECT id, date, ot_type AS type, start_time, end_time, hours, status, reason FROM ot_requests "
+               "WHERE agent_id=? ORDER BY date DESC LIMIT 50", (aid,))
+        st.markdown("**Time off**")
+        st.dataframe(lv.drop(columns="id"), hide_index=True, width="stretch") if len(lv) else st.caption("None yet.")
+        st.markdown("**Overtime**")
+        st.dataframe(ot.drop(columns="id"), hide_index=True, width="stretch") if len(ot) else st.caption("None yet.")
+        pend = {f"lv{r.id}": f"Time off · {r.type} · {r.start_date}→{r.end_date}"
+                for r in lv[lv.status == "Pending"].itertuples()}
+        pend.update({f"ot{r.id}": f"OT · {r.date} {r.start_time}-{r.end_time}"
+                     for r in ot[ot.status == "Pending"].itertuples()})
+        if pend:
+            pick = st.selectbox("Cancel a pending request", list(pend), format_func=pend.get, key="my_cancel")
+            if st.button("Cancel request"):
+                kind, rid = pick[:2], int(pick[2:])
+                if kind == "lv":
+                    ex("UPDATE leaves SET status='Cancelled' WHERE id=? AND agent_id=? AND status='Pending'", (rid, aid))
+                else:
+                    ex("UPDATE ot_requests SET status='Cancelled' WHERE id=? AND agent_id=? AND status='Pending'",
+                       (rid, aid))
+                st.rerun()
+
+
+# ----------------------------------------------------------------- admin: live floor, users, clock logs
+def floor_status(now=None):
+    """Everyone who should be (or is) on the floor right now."""
+    now = now or now_site()
+    sch = build_schedule(now.date() - ONE_DAY, now.date() + ONE_DAY)
+    users = q("SELECT agent_id FROM users WHERE role='agent' AND active=1 AND agent_id IS NOT NULL")
+    has_login = {int(float(a)) for a in users.agent_id}
+    logs = q("SELECT agent_id, shift_date, event, ts FROM time_logs WHERE ts>=? ORDER BY ts, id",
+             ((now - dt.timedelta(hours=30)).isoformat(),))
+    rows = []
+    seen = set()
+    for r in sch.itertuples():
+        if r.kind not in WORK_KINDS and r.kind != "Leave":
+            continue
+        d = dt.date.fromisoformat(r.date)
+        if r.kind == "Leave":
+            ag = agents_df(True)
+            base = ag[ag.id == r.agent_id]
+            if base.empty or d != now.date():
+                continue
+            s, e = shift_window(d, base.shift_start.iloc[0], base.shift_end.iloc[0])
+        else:
+            s, e = shift_window(d, r.shift_start, r.shift_end)
+        mine = logs[(logs.agent_id == r.agent_id) & (logs.shift_date == r.date)]
+        if not (s - dt.timedelta(hours=1) <= now <= e + dt.timedelta(hours=1)) and mine.empty:
+            continue
+        if not mine.empty and mine.iloc[-1].event == "logout" and now > e + dt.timedelta(hours=1):
+            continue
+        seen.add((r.agent_id, r.date))
+        events = [(ev, _dt(t)) for ev, t in zip(mine.event, mine.ts)]
+        b = break_summary(events, now) if events else None
+        login = next((t for ev, t in events if ev == "login"), None)
+        if r.kind == "Leave":
+            status, flag = "Time off", ""
+        elif not events:
+            late = mins(now - s)
+            status = f"Not logged in — {late} min late" if late > setting("grace_min") else "Not logged in yet"
+            flag = "late" if late > setting("grace_min") else ""
+        else:
+            last = events[-1][0]
+            if last == "logout":
+                status, flag = f"Logged out {events[-1][1]:%H:%M}", ""
+            elif last in ("break_start", "lunch_start"):
+                kind, m = b["ongoing"]
+                lim = b["allowed"][kind][0]
+                status = f"On {kind} {m} min" + (f" — OVER by {m - lim:g}" if m > lim else "")
+                flag = "over" if m > lim else "break"
+            elif now > e + dt.timedelta(hours=1):
+                status, flag = "Still logged in after shift — missing log out?", "late"
+            else:
+                status, flag = "Working", "ok"
+        rows.append(dict(agent=r.name, account=r.account, shift=f"{s:%H:%M}–{e:%H:%M}",
+                         shift_date=r.date, status=status, logged_in=f"{login:%H:%M}" if login else "",
+                         late_min=max(0, mins(login - s)) if login and login > s + dt.timedelta(
+                             minutes=setting("grace_min")) else 0,
+                         break_min=b["total"] if b else 0, overbreak_min=b["over"] if b else 0,
+                         has_login="Yes" if r.agent_id in has_login else "No", _flag=flag))
+    # unscheduled sessions still open
+    for (aid, sd), g in logs.groupby(["agent_id", "shift_date"]):
+        if (aid, sd) in seen or g.iloc[-1].event == "logout":
+            continue
+        ag = agent_row(int(aid))
+        rows.append(dict(agent=ag["name"] if ag is not None else aid, account=ag["account"] if ag is not None else "",
+                         shift="unscheduled", shift_date=sd, status="Working (unscheduled)",
+                         logged_in=_dt(g[g.event == "login"].ts.iloc[0]).strftime("%H:%M") if (g.event == "login").any()
+                         else "", late_min=0, break_min=0, overbreak_min=0, has_login="Yes", _flag="ok"))
+    return pd.DataFrame(rows, columns=["agent", "account", "shift", "shift_date", "status", "logged_in", "late_min",
+                                       "break_min", "overbreak_min", "has_login", "_flag"])
+
+
+def page_live_floor(acct):
+    st.header("🟢 Live Floor")
+    n = mark_no_shows()
+    if n:
+        st.toast(f"Marked {n} no-show(s) as Absent")
+        flush_to_sheet()
+    _live_board(acct)
+
+
+@st.fragment(run_every="30s")
+def _live_board(acct):
+    now = now_site()
+    df = floor_status(now)
+    if acct != "All accounts":
+        df = df[df.account == acct]
+    st.caption(f"As of {now:%H:%M:%S} ({setting_str('site_tz')}) · refreshes every 30 seconds")
+    m = st.columns(6)
+    m[0].metric("On shift now", int((~df.status.str.startswith("Time off")).sum()))
+    m[1].metric("Working", int((df._flag == "ok").sum()))
+    m[2].metric("On break/lunch", int(df._flag.isin(["break", "over"]).sum()))
+    m[3].metric("Over-break now", int((df._flag == "over").sum()))
+    m[4].metric("Late / not logged in", int((df._flag == "late").sum()))
+    m[5].metric("Time off", int(df.status.eq("Time off").sum()))
+    if df.empty:
+        st.info("Nobody is scheduled around this time.")
+        return
+    colors = {"late": "background-color:#fadbd8;color:#000", "over": "background-color:#f5b7b1;color:#000",
+              "break": "background-color:#fef9e7;color:#000", "ok": "background-color:#e9f7ef;color:#000"}
+    order = {"over": 0, "late": 1, "break": 2, "ok": 3, "": 4}
+    df = df.assign(_o=df._flag.map(order)).sort_values(["_o", "account", "agent"]).drop(columns="_o")
+    flags = df._flag.tolist()
+    view = df.drop(columns="_flag").reset_index(drop=True)
+    sty = view.style.apply(lambda row: [colors.get(flags[row.name], "")] * len(row), axis=1)
+    st.dataframe(sty, hide_index=True, width="stretch", height=min(700, 40 + 35 * len(view)), column_config={
+        "agent": "Agent", "account": "Account", "shift": "Shift", "shift_date": "Shift date", "status": "Status",
+        "logged_in": "Logged in", "late_min": "Late (min)", "break_min": "Breaks (min)",
+        "overbreak_min": "Over-break (min)", "has_login": "Has login"})
+    if (view.has_login == "No").any():
+        st.caption("Agents without a login can't clock in — create their logins under **Users**.")
+
+
+def page_users(acct):
+    st.header("🔐 Users & Logins")
+    me = current_user()["username"]
+    users = q("SELECT u.username, u.role, a.name AS agent, a.emp_id, a.account, u.active, u.must_change, "
+              "u.last_login, u.locked_until, u.agent_id FROM users u LEFT JOIN agents a ON a.id=u.agent_id "
+              "ORDER BY u.role, a.name, u.username")
+    m = st.columns(3)
+    m[0].metric("Admins", int((users.role == "admin").sum()))
+    m[1].metric("Agent logins", int((users.role == "agent").sum()))
+    ag = agents_df(True)
+    no_login = ag[~ag.id.isin(pd.to_numeric(users.agent_id, errors="coerce").dropna().astype(int))]
+    m[2].metric("Active agents without a login", len(no_login))
+    show = users.drop(columns=["agent_id"]).copy()
+    show["active"] = show.active.fillna(0).astype(int).map({1: "Yes", 0: "No"})
+    show["must_change"] = show.must_change.fillna(0).astype(int).map({1: "Temp password", 0: ""})
+    st.dataframe(show, hide_index=True, width="stretch", column_config={"must_change": "Password"})
+
+    if st.session_state.get("new_creds") is not None:
+        creds = st.session_state["new_creds"]
+        st.success(f"{len(creds)} login(s) ready. Share each temporary password privately — it's shown only now. "
+                   "Agents must set their own password the first time they sign in.")
+        st.dataframe(creds, hide_index=True, width="stretch")
+        st.download_button("⬇️ Download logins (CSV)", creds.to_csv(index=False), "new_logins.csv")
+        if st.button("Done — hide passwords"):
+            st.session_state.pop("new_creds")
+            st.rerun()
+
+    t1, t2, t3 = st.tabs(["Create agent logins", "Add a user", "Manage a user"])
+    with t1:
+        st.caption("Creates a login for every active agent who doesn't have one. Username = employee ID; "
+                   "each gets a random temporary password.")
+        if no_login.empty:
+            st.success("Every active agent has a login.")
+        else:
+            st.dataframe(no_login[["emp_id", "name", "account"]], hide_index=True, width="stretch")
+            if st.button(f"Create {len(no_login)} agent login(s)", type="primary", key="mk_logins"):
+                rows = []
+                for r in no_login.itertuples():
+                    un = str(r.emp_id).strip()
+                    if get_user(un) is not None:
+                        un = f"{un}-{r.id}"
+                    pw = temp_password()
+                    ex("INSERT INTO users(username,pw_hash,role,agent_id,active,must_change,created_on) "
+                       "VALUES(?,?,?,?,?,?,?)", (un, hash_pw(pw), "agent", int(r.id), 1, 1, now_site().isoformat()))
+                    rows.append(dict(name=r.name, account=r.account, username=un, temporary_password=pw))
+                st.session_state["new_creds"] = pd.DataFrame(rows)
+                rerun()
+    with t2:
+        with st.form("add_user"):
+            c = st.columns(3)
+            role = c[0].selectbox("Role", ["agent", "admin"])
+            un = c[1].text_input("Username", help="For agents, the employee ID works well")
+            pw = c[2].text_input("Password (blank = generate a temporary one)", type="password")
+            labels = agent_label_map(ag)
+            link = st.selectbox("Linked agent (agents only)", [None] + list(labels),
+                                format_func=lambda k: "—" if k is None else labels[k])
+            if st.form_submit_button("Add user", type="primary"):
+                temp = not pw
+                pw = pw or temp_password()
+                prob = None if temp else pw_problem(pw)
+                if not un.strip():
+                    st.error("Enter a username.")
+                elif get_user(un) is not None:
+                    st.error("That username is taken.")
+                elif role == "agent" and link is None:
+                    st.error("Link the agent login to someone on the roster.")
+                elif role == "agent" and len(q("SELECT 1 FROM users WHERE agent_id=?", (link,))):
+                    st.error("That agent already has a login.")
+                elif prob:
+                    st.error(prob)
+                else:
+                    ex("INSERT INTO users(username,pw_hash,role,agent_id,active,must_change,created_on) "
+                       "VALUES(?,?,?,?,?,?,?)", (un.strip(), hash_pw(pw), role, link if role == "agent" else None,
+                                                 1, 1, now_site().isoformat()))
+                    st.session_state["new_creds"] = pd.DataFrame([dict(
+                        name=labels.get(link, "") if role == "agent" else "(admin)", account="", username=un.strip(),
+                        temporary_password=pw if temp else "(the password you typed)")])
+                    rerun()
+    with t3:
+        if users.empty:
+            st.caption("No users.")
+        else:
+            pick = st.selectbox("User", users.username.tolist(), key="mg_user",
+                                format_func=lambda x: f"{x} · " + str(users.set_index('username').loc[x, 'role']) +
+                                (f" · {users.set_index('username').loc[x, 'agent']}"
+                                 if isinstance(users.set_index('username').loc[x, 'agent'], str) else ""))
+            row = users.set_index("username").loc[pick]
+            active = int(row.active or 0)
+            admins_active = int(((users.role == "admin") & (users.active.fillna(0).astype(int) == 1)).sum())
+            last_admin = row.role == "admin" and active and admins_active <= 1
+            c = st.columns(4)
+            if c[0].button("🔁 Reset password", key="mg_reset"):
+                pw = temp_password()
+                ex("UPDATE users SET pw_hash=?, must_change=1, failed=0, locked_until=NULL WHERE username=?",
+                   (hash_pw(pw), pick))
+                st.session_state["new_creds"] = pd.DataFrame([dict(name=row.agent if isinstance(row.agent, str) else "",
+                                                                   account="", username=pick, temporary_password=pw)])
+                rerun()
+            if c[1].button("🔓 Unlock", key="mg_unlock"):
+                ex("UPDATE users SET failed=0, locked_until=NULL WHERE username=?", (pick,))
+                rerun()
+            if c[2].button("Disable" if active else "Enable", key="mg_toggle",
+                           disabled=bool(last_admin or pick == me)):
+                ex("UPDATE users SET active=? WHERE username=?", (0 if active else 1, pick))
+                rerun()
+            if c[3].button("🗑️ Delete", key="mg_delete", disabled=bool(last_admin or pick == me)):
+                ex("DELETE FROM users WHERE username=?", (pick,))
+                rerun()
+            if pick == me or last_admin:
+                st.caption("You can't disable or delete your own login or the last active admin.")
+
+
+def page_clock_logs(acct):
+    st.subheader("Clock logs")
+    st.caption("Every log in / break / log out, as recorded. Fix mistakes here (e.g. a forgotten log out) — "
+               "attendance recalculates automatically.")
+    day = st.date_input("Shift date", today_site(), key="cl_day")
+    ag = agents_df(True, acct)
+    logs = q("SELECT l.id, a.name, l.agent_id, l.shift_date, l.event, l.ts, l.source, l.note FROM time_logs l "
+             "JOIN agents a ON a.id=l.agent_id WHERE l.shift_date=? ORDER BY a.name, l.ts, l.id", (str(day),))
+    logs = logs[logs.agent_id.isin(ag.id)]
+    if logs.empty:
+        st.caption("No clock events for this shift date.")
+    else:
+        view = logs.assign(event=logs.event.map(CLOCK_EVENTS).fillna(logs.event),
+                           time=[str(t)[:16].replace("T", " ") for t in logs.ts])
+        st.dataframe(view[["id", "name", "event", "time", "source", "note"]], hide_index=True, width="stretch")
+        c = st.columns([3, 1])
+        dels = c[0].multiselect("Delete events (by id)", view.id.tolist(), key="cl_del",
+                                format_func=lambda i: f"#{i} · " + " · ".join(
+                                    view[view.id == i][["name", "event", "time"]].iloc[0].astype(str)))
+        if c[1].button("Delete selected", disabled=not dels, key="cl_del_btn"):
+            hit = logs[logs.id.isin(dels)][["agent_id", "shift_date"]].drop_duplicates()
+            for i in dels:
+                ex("DELETE FROM time_logs WHERE id=?", (int(i),))
+            for r in hit.itertuples():
+                if len(q("SELECT 1 FROM time_logs WHERE agent_id=? AND shift_date=?", (r.agent_id, r.shift_date))):
+                    rebuild_attendance(int(r.agent_id), r.shift_date)
+                else:
+                    ex("DELETE FROM attendance WHERE agent_id=? AND date=?", (int(r.agent_id), r.shift_date))
+            st.session_state.pop("cl_del", None)
+            rerun()
+    with st.form("cl_add"):
+        st.markdown("**Add a missing event**")
+        labels = agent_label_map(ag)
+        c = st.columns(4)
+        aid = c[0].selectbox("Agent", list(labels), format_func=labels.get) if labels else None
+        ev = c[1].selectbox("Event", list(CLOCK_EVENTS), format_func=CLOCK_EVENTS.get, index=4)
+        d = c[2].date_input("Date of the event", day, help="Calendar date it happened (after midnight = next day)")
+        t = c[3].text_input("Time (HH:MM)", "07:00")
+        note = st.text_input("Reason for the correction", "Forgot to log out")
+        if st.form_submit_button("Add event") and aid is not None:
+            if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", t):
+                st.error("Time must be HH:MM.")
+            else:
+                ts = dt.datetime.combine(d, parse_t(t))
+                ex("INSERT INTO time_logs(agent_id,shift_date,event,ts,source,note) VALUES(?,?,?,?,?,?)",
+                   (aid, str(day), ev, ts.isoformat(), f"admin:{current_user()['username']}", note))
+                rebuild_attendance(aid, day)
+                rerun()
+
+
 # ----------------------------------------------------------------- layout
-PAGES = {
+auth_gate()  # nothing below runs until someone is signed in
+USER = current_user()
+
+ADMIN_PAGES = {
+    "🟢 Live Floor": page_live_floor,
     "📊 Dashboard": page_dashboard,
     "⏱️ Attendance": page_attendance,
     "📶 Interval Planner": page_interval,
@@ -1978,34 +2970,48 @@ PAGES = {
     "🧩 Coverage Finder": page_coverage,
     "⏰ Overtime": page_ot,
     "📈 Reports": page_reports,
-    "👥 Roster & Accounts": None,
-    "⚙️ Settings": None,
+    "👥 Roster & Accounts": lambda acct: page_roster(),
+    "🔐 Users": page_users,
+    "⚙️ Settings": lambda acct: page_settings(),
+    "🔑 My password": lambda acct: page_change_password(),
 }
+AGENT_PAGES = {
+    "🕒 My Shift": lambda acct: page_my_shift(),
+    "📝 My Requests": lambda acct: page_my_requests(),
+    "🔑 My password": lambda acct: page_change_password(),
+}
+PAGES = ADMIN_PAGES if is_admin() else AGENT_PAGES  # agents never get the admin pages
 
 with st.sidebar:
     st.title("🗓️ WFM Scheduler")
+    who = USER["username"]
+    if USER.get("agent_id") is not None:
+        ar = agent_row(USER["agent_id"])
+        who = ar["name"] if ar is not None else who
+    st.caption(f"Signed in as **{who}** ({USER['role']})")
     page = st.radio("Go to", list(PAGES), label_visibility="collapsed")
     st.divider()
-    acct_filter = st.selectbox("Account filter", ["All accounts"] + account_names())
-    st.caption(f"Today: {dt.date.today():%a, %b %d %Y}")
-    st.divider()
-    if STORE is not None:
-        synced = dt.datetime.fromtimestamp(STORE.loaded_at).strftime("%H:%M")
-        st.caption(f"🟢 Google Sheet: **{STORE.title}**  \nLast loaded {synced}"
-                   + (f"  \n⚠️ {len(STORE.dirty)} tab(s) waiting to save" if STORE.dirty else ""))
-        if st.button("🔄 Reload from Google Sheet", width="stretch"):
-            if flush_to_sheet():
-                STORE.load()
-            st.rerun()
-    else:
-        st.caption("💾 Saving to local file `wfm.db`")
+    acct_filter = st.selectbox("Account filter", ["All accounts"] + account_names()) if is_admin() else "All accounts"
+    st.caption(f"Today: {now_site():%a, %b %d %Y · %H:%M}")
+    if st.button("Sign out", width="stretch"):
+        logout_session()
+        st.rerun()
+    if is_admin():
+        st.divider()
+        if STORE is not None:
+            synced = dt.datetime.fromtimestamp(STORE.loaded_at).strftime("%H:%M")
+            waiting = len(STORE.dirty) + sum(1 for v in STORE.appends.values() if v)
+            st.caption(f"🟢 Google Sheet: **{STORE.title}**  \nLast loaded {synced}"
+                       + (f"  \n⏳ {waiting} change(s) saving…" if waiting else "")
+                       + (f"  \n⚠️ Last save error: {STORE.last_error}" if STORE.last_error else ""))
+            if st.button("🔄 Reload from Google Sheet", width="stretch"):
+                if flush_to_sheet(sync=True):
+                    STORE.load()
+                st.rerun()
+        else:
+            st.caption("💾 Saving to local file `wfm.db`")
 
-if page == "👥 Roster & Accounts":
-    page_roster()
-elif page == "⚙️ Settings":
-    page_settings()
-else:
-    PAGES[page](acct_filter)
+PAGES[page](acct_filter)
 
 # Push anything saved during this run (forms that don't rerun) to the sheet.
 flush_to_sheet()

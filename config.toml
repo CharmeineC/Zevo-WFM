@@ -1,0 +1,3 @@
+[client]
+# hide the developer menu from agents
+toolbarMode = "minimal"
