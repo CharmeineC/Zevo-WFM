@@ -530,12 +530,14 @@ def week_start(day):
     return day - dt.timedelta(days=day.weekday())
 
 
-def build_schedule(start, end, account=None):
+def build_schedule(start, end, account=None, agent_id=None):
     """Effective schedule per agent per day: overrides > default shift/rest days,
     then approved leave replaces any working day."""
     cols = ["agent_id", "emp_id", "name", "account", "lob", "skills", "date",
             "kind", "shift_start", "shift_end", "note"]
     ag = agents_df(True, account)
+    if agent_id is not None:
+        ag = ag[ag.id == int(agent_id)]
     if ag.empty:
         return pd.DataFrame(columns=cols)
     s, e = str(start), str(end)
@@ -2319,13 +2321,17 @@ def agent_row(agent_id):
 
 
 def _dt(s):
-    return dt.datetime.fromisoformat(str(s))
+    """Parse a stored timestamp; tolerant of hand edits in the sheet (e.g. '2026-10-12 8:00')."""
+    try:
+        return dt.datetime.fromisoformat(str(s).strip())
+    except ValueError:
+        return pd.to_datetime(str(s).strip(), format="mixed").to_pydatetime().replace(tzinfo=None)
 
 
 def agent_shift_windows(agent_id, d1, d2):
     """Work windows (with login-open time) for one agent's shifts starting d1..d2."""
-    sch = build_schedule(d1, d2)
-    sch = sch[(sch.agent_id == agent_id) & sch.kind.isin(WORK_KINDS)]
+    sch = build_schedule(d1, d2, agent_id=agent_id)
+    sch = sch[sch.kind.isin(WORK_KINDS)]
     ot = q("SELECT date, start_time, end_time FROM ot_requests WHERE agent_id=? AND status='Approved' "
            "AND date BETWEEN ? AND ?", (agent_id, str(d1), str(d2)))
     early = dt.timedelta(hours=setting("login_early_hrs"))
@@ -2529,8 +2535,7 @@ def page_my_shift():
 
     st.subheader("My schedule — next 7 days")
     today = today_site()
-    sch = build_schedule(today, today + 6 * ONE_DAY)
-    mine = sch[sch.agent_id == int(aid)].copy()
+    mine = build_schedule(today, today + 6 * ONE_DAY, agent_id=int(aid)).copy()
     if len(mine):
         mine["day"] = [f"{dt.date.fromisoformat(d):%a %b %d}" for d in mine.date]
         mine["schedule"] = [cell_label(r) if r.kind != "Leave" else f"Time off ({r.note})" for r in mine.itertuples()]
