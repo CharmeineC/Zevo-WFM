@@ -91,7 +91,9 @@ Pick the **timezone of the file** (US clients usually report in their own time).
 - **Forgot to log out:** the next log in flags the old shift **"No log out"**. Fix it in **Attendance → Clock logs → Add a missing event**; attendance recalculates.
 - All clock times use the **site timezone** in Settings (default US Central — America/Chicago, daylight saving handled), even though the cloud server runs on UTC.
 
-**Notes.** Refreshing the browser signs you out (sign in again). Agents' clicks are saved to the Google Sheet in small batches every few seconds, so 20+ agents logging in at once stay well within Google's limits; admin actions save immediately.
+**Staying signed in.** Refreshing the page or reopening the link keeps you signed in for 12 hours (Settings → Time clock → *Stay signed in…*; 0 turns it off). It uses a browser cookie holding a random key — only a scrambled copy is stored in the sheet's `sessions` tab, so the sheet can't be used to sign in as someone. **Sign out** ends it immediately, and resetting a password, disabling or deleting a login ends that person's sessions everywhere. **On shared computers, agents must click Sign out at the end of their shift**, or the next person could use their session.
+
+**Notes.** Agents' clicks are saved to the Google Sheet in small batches every few seconds, so 20+ agents logging in at once stay well within Google's limits; admin actions save immediately.
 
 ### Attendance rules
 
@@ -133,7 +135,7 @@ The app logs in to Google as a **service account**: a robot Google user that onl
 2. Click **Share**, paste the service account's `client_email`, give it **Editor**, untick "Notify people", Share.
 3. Copy the sheet's URL.
 
-The app creates all the tabs it needs on first run: `accounts`, `agents`, `schedule_overrides`, `attendance`, `leaves`, `ot_requests`, `settings`, `interval_volume`, `users`, `time_logs`. The `users` tab holds encrypted passwords only — still, share the sheet with admins only.
+The app creates all the tabs it needs on first run: `accounts`, `agents`, `schedule_overrides`, `attendance`, `leaves`, `ot_requests`, `settings`, `interval_volume`, `users`, `time_logs`, `sessions`. The `users` tab holds encrypted passwords only — still, share the sheet with admins only.
 
 **C. Give the app the key**
 

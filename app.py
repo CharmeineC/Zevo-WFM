@@ -31,6 +31,7 @@ import altair as alt
 import numpy as np
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 
 def _sheet_secrets():
@@ -51,7 +52,7 @@ if USE_SHEETS:
 else:
     DB_PATH = os.environ.get("WFM_DB", "wfm.db")
 TABLES = ["accounts", "agents", "schedule_overrides", "attendance", "leaves", "ot_requests", "settings",
-          "interval_volume", "users", "time_logs"]
+          "interval_volume", "users", "time_logs", "sessions"]
 APPEND_TABLES = {"time_logs"}  # insert-only logs are appended to the sheet instead of rewriting the tab
 _WRITE_RE = re.compile(r"^\s*(?:INSERT(?:\s+OR\s+\w+)?\s+INTO|UPDATE|DELETE\s+FROM)\s+(\w+)", re.I)
 DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
@@ -87,6 +88,7 @@ DEFAULT_SETTINGS = {
     "lunches_allowed": "0",    # 0 = no lunch (the Start lunch button is hidden)
     "login_early_hrs": "4",    # how early before a shift an agent can log in to it
     "auto_absent": "1",        # mark agents with a login Absent when they never log in for a shift
+    "remember_hrs": "12",      # stay signed in through page refreshes for this many hours (0 = off)
 }
 CHANNELS = ["Voice", "Chat", "Email / Back Office"]
 INTERVAL_MIN = 30
@@ -125,6 +127,8 @@ CREATE TABLE IF NOT EXISTS users(
   username TEXT PRIMARY KEY, pw_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'agent', agent_id INTEGER,
   active INTEGER DEFAULT 1, must_change INTEGER DEFAULT 1, failed INTEGER DEFAULT 0, locked_until TEXT,
   last_login TEXT, created_on TEXT);
+CREATE TABLE IF NOT EXISTS sessions(
+  token_hash TEXT PRIMARY KEY, username TEXT, created TEXT, expires TEXT);
 CREATE TABLE IF NOT EXISTS time_logs(
   id INTEGER PRIMARY KEY AUTOINCREMENT, agent_id INTEGER, shift_date TEXT, event TEXT, ts TEXT,
   source TEXT, note TEXT);
@@ -1506,6 +1510,9 @@ def page_settings():
                                                     step=1.0, help="0 hides the Start lunch button")
         vals["login_early_hrs"] = c[4].number_input("Can log in up to (h) early", 0.5, 8.0,
                                                     setting("login_early_hrs"), step=0.5)
+        vals["remember_hrs"] = st.number_input(
+            "Stay signed in through page refreshes for (hours)", 0.0, 720.0, setting("remember_hrs"), step=1.0,
+            help="0 = refreshing the page signs people out. Keep it short if agents share computers.")
         vals["auto_absent"] = 1.0 if c[5].toggle("Auto-mark no-shows Absent", bool(int(setting("auto_absent"))),
                                                  help="Only for agents who have a login") else 0.0
         if st.form_submit_button("Save settings"):
@@ -1544,6 +1551,7 @@ def page_settings():
                       "time_logs"):
                 ex(f"DELETE FROM {t}")
             ex("DELETE FROM users WHERE role='agent'")  # agent logins point at roster rows that are now gone
+            ex("DELETE FROM sessions WHERE username NOT IN (SELECT username FROM users)")
             st.success("All data deleted. Admin logins were kept; agent logins were removed — recreate them under "
                        "**Users** after importing your roster.")
 
@@ -2280,23 +2288,90 @@ def authenticate(username, pw):
     return u, None
 
 
-def start_session(u):
+SESSION_COOKIE = "wfm_session"
+
+
+def _token_hash(token):
+    return hashlib.sha256(str(token).encode()).hexdigest()
+
+
+def start_session(u, remember=True, sid=None):
     st.session_state["auth"] = {"username": u["username"], "role": u["role"],
                                 "agent_id": int(u["agent_id"]) if pd.notna(u.get("agent_id")) and
-                                u.get("agent_id") not in (None, "") else None}
+                                u.get("agent_id") not in (None, "") else None, "sid": sid}
+    hrs = setting("remember_hrs")
+    if remember and hrs > 0 and sid is None:
+        token = secrets.token_urlsafe(32)  # only its hash is stored; the browser keeps the token
+        now = now_site()
+        ex("DELETE FROM sessions WHERE expires<?", (now.isoformat(),))
+        ex("INSERT INTO sessions(token_hash,username,created,expires) VALUES(?,?,?,?)",
+           (_token_hash(token), u["username"], now.isoformat(), (now + dt.timedelta(hours=hrs)).isoformat()))
+        st.session_state["auth"]["sid"] = _token_hash(token)
+        st.session_state["_cookie_set"] = (token, int(hrs * 3600))
+
+
+def end_user_sessions(username, keep_sid=None):
+    """Sign a user out everywhere (password reset, disabled, deleted...)."""
+    ex("DELETE FROM sessions WHERE username=? AND token_hash IS NOT ?", (username, keep_sid))
 
 
 def logout_session():
+    sid = (current_user() or {}).get("sid")
+    if sid:
+        ex("DELETE FROM sessions WHERE token_hash=?", (sid,))
     for k in list(st.session_state.keys()):
         del st.session_state[k]
+    st.session_state["_cookie_clear"] = True
+    st.session_state["_signed_out"] = True  # don't re-read the old cookie in this browser tab
+
+
+def _cookie_js():
+    """Write or clear the sign-in cookie in the browser (Streamlit can read cookies but not set them)."""
+    js = None
+    if st.session_state.get("_cookie_set"):
+        token, age = st.session_state.pop("_cookie_set")
+        js = f"'{SESSION_COOKIE}={token}; path=/; max-age={age}; SameSite=Lax'"
+    elif st.session_state.pop("_cookie_clear", False):
+        js = f"'{SESSION_COOKIE}=; path=/; max-age=0; SameSite=Lax'"
+    if js:
+        components.html("<script>const d = window.parent.document; "
+                        f"d.cookie = {js} + (window.parent.location.protocol === 'https:' ? '; Secure' : '');"
+                        "</script>", height=0)
+
+
+def restore_from_cookie():
+    """Sign back in after a page refresh using the browser's sign-in cookie."""
+    if st.session_state.get("_signed_out") or setting("remember_hrs") <= 0:
+        return False
+    try:
+        token = st.context.cookies.get(SESSION_COOKIE)
+    except Exception:
+        token = None
+    if not token:
+        return False
+    h = _token_hash(token)
+    row = q("SELECT username, expires FROM sessions WHERE token_hash=?", (h,))
+    if row.empty or str(row.expires.iloc[0]) < now_site().isoformat():
+        st.session_state["_cookie_clear"] = True
+        return False
+    u = get_user(row.username.iloc[0])
+    if u is None or not int(u.get("active") or 0):
+        st.session_state["_cookie_clear"] = True
+        return False
+    start_session(u, sid=h)
+    return True
 
 
 def auth_gate():
     """Show the login (or first-admin setup) screen until someone is signed in."""
+    _cookie_js()
     u = current_user()
+    if not u and restore_from_cookie():
+        u = current_user()
     if u:
         fresh = get_user(u["username"])
-        if fresh is None or not int(fresh.get("active") or 0):
+        ended = u.get("sid") and q("SELECT 1 FROM sessions WHERE token_hash=?", (u["sid"],)).empty
+        if fresh is None or not int(fresh.get("active") or 0) or ended:
             logout_session()
             st.rerun()
         u["role"] = fresh["role"]
@@ -2379,6 +2454,7 @@ def page_change_password(forced=False):
                     st.error("Choose a password different from the current one.")
                 else:
                     ex("UPDATE users SET pw_hash=?, must_change=0 WHERE username=?", (hash_pw(pw), me["username"]))
+                    end_user_sessions(me["username"], keep_sid=u.get("sid"))
                     flush_to_sheet(sync=True)
                     st.success("Password saved.")
                     if forced:
@@ -2976,6 +3052,7 @@ def page_users(acct):
                 pw = temp_password()
                 ex("UPDATE users SET pw_hash=?, must_change=1, failed=0, locked_until=NULL WHERE username=?",
                    (hash_pw(pw), pick))
+                end_user_sessions(pick)
                 st.session_state["new_creds"] = pd.DataFrame([dict(name=row.agent if isinstance(row.agent, str) else "",
                                                                    account="", username=pick, temporary_password=pw)])
                 rerun()
@@ -2985,9 +3062,11 @@ def page_users(acct):
             if c[2].button("Disable" if active else "Enable", key="mg_toggle",
                            disabled=bool(last_admin or pick == me)):
                 ex("UPDATE users SET active=? WHERE username=?", (0 if active else 1, pick))
+                end_user_sessions(pick)
                 rerun()
             if c[3].button("🗑️ Delete", key="mg_delete", disabled=bool(last_admin or pick == me)):
                 ex("DELETE FROM users WHERE username=?", (pick,))
+                end_user_sessions(pick)
                 rerun()
             if pick == me or last_admin:
                 st.caption("You can't disable or delete your own login or the last active admin.")
