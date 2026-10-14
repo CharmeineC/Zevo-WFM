@@ -795,44 +795,111 @@ def weekly_ot(day):
     return {int(a): float(h) for a, h in zip(df.agent_id, df.h)}
 
 
-def find_coverage(day, need_start, need_end, account, skill="", exclude=()):
-    """Rank every active agent for covering a window on `day`."""
-    ns, ne = shift_window(day, need_start, need_end)
-    need_h = (ne - ns).total_seconds() / 3600
-    min_rest, max_daily, max_wk = setting("min_rest_hrs"), setting("max_daily_hrs"), setting("max_weekly_ot_hrs")
-    lob_df = q("SELECT lob FROM accounts WHERE name=?", (account,))
-    lob = lob_df.lob[0] if len(lob_df) else None
+def _cover_rules(ctx, s, e, min_rest, max_daily, max_wk):
+    """Reasons an agent can't cover s–e (datetimes), and whether it extends one of their shifts."""
+    reasons, adjacent = [], False
+    hrs = (e - s).total_seconds() / 3600
+    for ws, we, ss, se, d in ctx["shifts"]:
+        if ws < e and s < we:
+            reasons.append(f"Already scheduled {ss}-{se} ({d})")
+            continue
+        gap_h = ((s - we) if we <= s else (ws - e)).total_seconds() / 3600
+        if gap_h < 1:  # back-to-back = shift extension
+            adjacent = True
+            if (we - ws).total_seconds() / 3600 + hrs > max_daily:
+                reasons.append(f"Shift + OT exceeds {max_daily:g}h daily max")
+        elif gap_h < min_rest:
+            reasons.append(f"Only {gap_h:.1f}h rest (min {min_rest:g}h)")
+    if not adjacent and hrs > max_daily:
+        reasons.append(f"Longer than the {max_daily:g}h daily max")
+    for os_, oe, lbl in ctx["ot"]:
+        if os_ < e and s < oe:
+            reasons.append(f"Already has OT {lbl}")
+    if ctx["wk"] + hrs > max_wk + 1e-9:
+        reasons.append(f"Weekly OT would hit {ctx['wk'] + hrs:.1f}h (cap {max_wk:g}h)")
+    return reasons, adjacent
+
+
+def _best_part(ctx, ns, ne, rules, min_h, segments=None):
+    """Longest legal sub-window (30-min steps) inside ns–ne, or inside the given uncovered segments."""
+    step = dt.timedelta(minutes=30)
+    best = None
+    for s0, e0 in (segments or [(ns, ne)]):
+        n = int((e0 - s0) / step)
+        for i in range(n):
+            for j in range(n, i, -1):
+                s, e = s0 + i * step, s0 + j * step
+                if best and (e - s) <= (best[1] - best[0]):
+                    break
+                if (e - s).total_seconds() / 3600 < min_h - 1e-9:
+                    break
+                reasons, adj = rules(ctx, s, e)
+                if not reasons:
+                    best = (s, e, adj)
+                    break
+    return best
+
+
+def coverage_context(day, exclude=()):
     sch = build_schedule(day - ONE_DAY, day + ONE_DAY)
     otw = weekly_ot(day)
-    skill = (skill or "").strip().lower()
-    out = []
+    ot = q("SELECT agent_id, date, start_time, end_time, status FROM ot_requests WHERE status IN "
+           "('Pending','Approved') AND date BETWEEN ? AND ?", (str(day - ONE_DAY), str(day + ONE_DAY)))
+    ctxs = {}
     for aid, g in sch.groupby("agent_id"):
         if aid in exclude:
             continue
-        info = g.iloc[0]
-        today = g[g.date == day.isoformat()].iloc[0]
-        reasons, adjacent = [], False
-        if today.kind == "Leave":
-            reasons.append("On approved leave")
-        if today.kind in ("Holiday",):
-            reasons.append("Holiday off")
+        shifts = []
         for r in g.itertuples():
-            if r.kind not in WORK_KINDS:
-                continue
-            ws, we = shift_window(dt.date.fromisoformat(r.date), r.shift_start, r.shift_end)
-            if ws < ne and ns < we:
-                reasons.append(f"Already scheduled {r.shift_start}-{r.shift_end} ({r.date})")
-                continue
-            gap_h = ((ns - we) if we <= ns else (ws - ne)).total_seconds() / 3600
-            if gap_h < 1:  # back-to-back = shift extension
-                adjacent = True
-                if (we - ws).total_seconds() / 3600 + need_h > max_daily:
-                    reasons.append(f"Shift + OT exceeds {max_daily:g}h daily max")
-            elif gap_h < min_rest:
-                reasons.append(f"Only {gap_h:.1f}h rest (min {min_rest:g}h)")
-        wk = otw.get(int(aid), 0.0)
-        if wk + need_h > max_wk:
-            reasons.append(f"Weekly OT would hit {wk + need_h:.1f}h (cap {max_wk:g}h)")
+            if r.kind in WORK_KINDS:
+                ws, we = shift_window(dt.date.fromisoformat(r.date), r.shift_start, r.shift_end)
+                shifts.append((ws, we, r.shift_start, r.shift_end, r.date))
+        ots = []
+        for r in ot[ot.agent_id == aid].itertuples():
+            od = dt.date.fromisoformat(r.date)
+            base = next(((a, b) for a, b, *_rest in shifts if _rest[2] == r.date), None)
+            os_, oe = place_ot(od, r.start_time, r.end_time, base) if base else shift_window(od, r.start_time, r.end_time)
+            if os_ is not None:
+                ots.append((os_, oe, f"{r.start_time}-{r.end_time} {r.date} ({r.status})"))
+        today = g[g.date == day.isoformat()].iloc[0]
+        ctxs[int(aid)] = dict(info=g.iloc[0], today=today, shifts=shifts, ot=ots, wk=otw.get(int(aid), 0.0))
+    return ctxs
+
+
+def _fmt_win(s, e):
+    return f"{s:%H:%M}-{e:%H:%M}"
+
+
+def find_coverage(day, need_start, need_end, account, skill="", exclude=()):
+    """Rank every active agent for covering a window on `day`, including who can cover part of it."""
+    ns, ne = shift_window(day, need_start, need_end)
+    min_rest, max_daily, max_wk = setting("min_rest_hrs"), setting("max_daily_hrs"), setting("max_weekly_ot_hrs")
+    min_h = max(0.5, setting("ot_min_block_hrs"))
+    rules = lambda c, s, e: _cover_rules(c, s, e, min_rest, max_daily, max_wk)
+    lob_df = q("SELECT lob FROM accounts WHERE name=?", (account,))
+    lob = lob_df.lob[0] if len(lob_df) else None
+    skill = (skill or "").strip().lower()
+    out = []
+    for aid, ctx in coverage_context(day, exclude).items():
+        info, today = ctx["info"], ctx["today"]
+        reasons, adjacent = rules(ctx, ns, ne)
+        blocked = []
+        if today.kind == "Leave":
+            blocked.append("On approved leave")
+        if today.kind == "Holiday":
+            blocked.append("Holiday off")
+        reasons = blocked + reasons
+        part = None
+        if reasons and not blocked:
+            part = _best_part(ctx, ns, ne, rules, min_h)
+        if not reasons:
+            cs, ce, can = ns, ne, "Full"
+        elif part:
+            cs, ce, adjacent = part
+            can = "Partial"
+        else:
+            cs = ce = None
+            can = "No"
         if today.kind in WORK_KINDS:
             ctype = "Pre/Post-shift OT" if adjacent else "Same-day OT (separate block)"
         else:
@@ -841,21 +908,126 @@ def find_coverage(day, need_start, need_end, account, skill="", exclude=()):
         score = (3 if info.account == account else 0) + (1 if info.lob == lob else 0)
         score += 2 if skill and skill in skills else 0
         score += 1 if adjacent else 0
-        score -= wk / 4
+        score -= ctx["wk"] / 4
+        hrs = round((ce - cs).total_seconds() / 3600, 2) if cs else 0.0
         out.append(dict(agent_id=int(aid), name=info["name"], emp_id=info.emp_id, account=info.account,
                         lob=info.lob, skills=info.skills, today=today.kind if today.kind != "Work"
                         else f"Work {today.shift_start}-{today.shift_end}",
-                        cover_type=ctype, ot_this_week=round(wk, 1), score=round(score, 2),
-                        eligible=not reasons, why_not="; ".join(reasons)))
+                        can_cover=can, cover_window=_fmt_win(cs, ce) if cs else "", cover_hrs=hrs,
+                        cover_type=ctype, ot_this_week=round(ctx["wk"], 1), score=round(score, 2),
+                        eligible=not reasons, why_not="; ".join(reasons),
+                        _s=cs, _e=ce))
     df = pd.DataFrame(out)
     if df.empty:
         return df
-    return df.sort_values(["eligible", "score"], ascending=[False, False]).reset_index(drop=True)
+    df["_rank"] = df.can_cover.map({"Full": 2, "Partial": 1, "No": 0})
+    return df.sort_values(["_rank", "cover_hrs", "score"], ascending=False).drop(columns="_rank").reset_index(drop=True)
+
+
+def split_cover_plan(day, need_start, need_end, account, skill="", exclude=()):
+    """Greedy plan: keep adding the agent who covers the most of what's still uncovered."""
+    ns, ne = shift_window(day, need_start, need_end)
+    min_rest, max_daily, max_wk = setting("min_rest_hrs"), setting("max_daily_hrs"), setting("max_weekly_ot_hrs")
+    min_h = max(0.5, setting("ot_min_block_hrs"))
+    rules = lambda c, s, e: _cover_rules(c, s, e, min_rest, max_daily, max_wk)
+    ranked = find_coverage(day, need_start, need_end, account, skill, exclude)
+    if ranked.empty:
+        return [], [(ns, ne)]
+    ctxs = coverage_context(day, exclude)
+    pool = [int(a) for a in ranked[ranked.can_cover != "No"].agent_id]
+    score = dict(zip(ranked.agent_id.astype(int), ranked.score))
+    segs, plan = [(ns, ne)], []
+    while segs and pool:
+        best = None
+        for aid in pool:
+            r = _best_part(ctxs[aid], ns, ne, rules, min_h, segs)
+            if r and (best is None or (r[1] - r[0], score[aid]) > (best[2] - best[1], score[best[0]])):
+                best = (aid, *r)
+        if not best:
+            break
+        aid, s, e, adj = best
+        plan.append(dict(agent_id=aid, start=s, end=e, adjacent=adj))
+        pool.remove(aid)
+        new = []
+        for a, b in segs:
+            if e <= a or s >= b:
+                new.append((a, b))
+                continue
+            if a < s:
+                new.append((a, s))
+            if e < b:
+                new.append((e, b))
+        segs = [x for x in new if (x[1] - x[0]).total_seconds() >= 1800]
+    plan.sort(key=lambda p: p["start"])
+    return plan, segs
+
+
+def gap_cover_status(gap_date, for_id, start, end, cov=None):
+    """Covers already assigned to one gap → (list of (start, end, name), uncovered segments, gap window)."""
+    gd = dt.date.fromisoformat(str(gap_date))
+    gs, ge = shift_window(gd, start, end)
+    if gs is None:
+        return [], [], (gs, ge)
+    if cov is None:
+        cov = q("SELECT o.agent_id, o.date, o.start_time, o.end_time, o.covering_for, o.reason, a.name FROM ot_requests o "
+                "LEFT JOIN agents a ON a.id=o.agent_id WHERE o.date BETWEEN ? AND ? AND o.status!='Denied' "
+                "AND o.covering_for=?", (str(gd - ONE_DAY), str(gd + ONE_DAY), for_id))
+    tag = f"[gap {gd}]"
+    wins = []
+    for r in cov.itertuples():
+        if int(r.covering_for) != for_id:
+            continue
+        reason = str(r.reason or "")
+        if not (tag in reason or (str(r.date) == str(gd) and "[gap " not in reason)):
+            continue
+        od = dt.date.fromisoformat(str(r.date))
+        cands = [shift_window(od + dt.timedelta(days=k), r.start_time, r.end_time) for k in (-1, 0, 1)]
+        a, b = max(cands, key=lambda w: (min(w[1], ge) - max(w[0], gs)).total_seconds())
+        if a < ge and gs < b:
+            wins.append((max(a, gs), min(b, ge), r.name))
+    left = [(gs, ge)]
+    for a, b, _ in wins:
+        nxt = []
+        for x, y in left:
+            if b <= x or a >= y:
+                nxt.append((x, y))
+                continue
+            if x < a:
+                nxt.append((x, a))
+            if b < y:
+                nxt.append((b, y))
+        left = nxt
+    left = [w for w in left if (w[1] - w[0]).total_seconds() >= 60]
+    return sorted(wins), left, (gs, ge)
+
+
+def assign_cover(aid, s, e, for_id, label, account, gap_day, cover_type):
+    """Create approved Coverage OT for s–e (datetimes). The OT is dated by the shift it extends,
+    otherwise by the calendar day it starts on."""
+    sch = build_schedule(s.date() - ONE_DAY, s.date() + ONE_DAY, agent_id=aid)
+    ot_date, kinds = s.date(), {}
+    for r in sch.itertuples():
+        kinds[r.date] = r.kind
+        if r.kind in WORK_KINDS:
+            ws, we = shift_window(dt.date.fromisoformat(r.date), r.shift_start, r.shift_end)
+            if abs((s - we).total_seconds()) < 3600 or abs((ws - e).total_seconds()) < 3600:
+                ot_date = dt.date.fromisoformat(r.date)
+    hrs = round((e - s).total_seconds() / 3600, 2)
+    tag = f" [gap {gap_day}]" if for_id else ""
+    ex("INSERT INTO ot_requests(agent_id,date,ot_type,start_time,end_time,hours,reason,status,covering_for,filed_on) "
+       "VALUES(?,?,?,?,?,?,?,?,?,?)", (aid, str(ot_date), "Coverage OT", f"{s:%H:%M}", f"{e:%H:%M}", hrs,
+                                      f"{cover_type} covering {label} ({account}){tag}", "Approved",
+                                      for_id, str(today_site())))
+    if kinds.get(str(ot_date)) not in WORK_KINDS:
+        ex("INSERT OR REPLACE INTO schedule_overrides VALUES(?,?,?,?,?,?)",
+           (aid, str(ot_date), "Work (RD OT)", f"{s:%H:%M}", f"{e:%H:%M}", f"Covering {label}"))
+    return hrs
 
 
 def open_gaps_range(d1, d2, account=None):
     """Leaves + absences between d1 and d2 (inclusive), with whether cover is assigned yet."""
-    out_cols = ["date", "agent_id", "name", "account", "lob", "shift_start", "shift_end", "reason", "covered"]
+    out_cols = ["date", "agent_id", "name", "account", "lob", "shift_start", "shift_end", "reason", "covered_hrs",
+                "covered"]
     sch = build_schedule(d1, d2, account)
     if sch.empty:
         return pd.DataFrame(columns=out_cols)
@@ -869,13 +1041,22 @@ def open_gaps_range(d1, d2, account=None):
     gaps = m[(m.kind == "Leave") | ((m.kind == "Work") & m.status.isin(ABSENT_STATUS))].copy()
     if gaps.empty:
         return pd.DataFrame(columns=out_cols)
-    cov = q("SELECT date, covering_for FROM ot_requests WHERE date BETWEEN ? AND ? AND status!='Denied' "
-            "AND covering_for IS NOT NULL", (str(d1), str(d2)))
-    covered = {(str(r.date), int(r.covering_for)) for r in cov.itertuples()}
-    gaps["covered"] = [(d, int(a)) in covered for d, a in zip(gaps.date, gaps.agent_id)]
-    gaps["reason"] = gaps.apply(lambda r: r.note if r.kind == "Leave" else r.status, axis=1)
     gaps["shift_start"] = gaps.shift_start.fillna(gaps.def_start)
     gaps["shift_end"] = gaps.shift_end.fillna(gaps.def_end)
+    cov = q("SELECT o.agent_id, o.date, o.start_time, o.end_time, o.covering_for, o.reason, a.name FROM ot_requests o "
+            "LEFT JOIN agents a ON a.id=o.agent_id WHERE o.date BETWEEN ? AND ? AND o.status!='Denied' "
+            "AND o.covering_for IS NOT NULL", (str(d1 - ONE_DAY), str(d2 + ONE_DAY)))
+    hrs, rem = [], []
+    for r in gaps.itertuples():
+        _, left, _ = gap_cover_status(r.date, int(r.agent_id), r.shift_start, r.shift_end, cov)
+        gs, ge = shift_window(dt.date.fromisoformat(r.date), r.shift_start, r.shift_end)
+        tot = (ge - gs).total_seconds() / 3600 if gs else 0
+        lh = sum((b - a).total_seconds() for a, b in left) / 3600
+        hrs.append(round(tot - lh, 2))
+        rem.append(lh)
+    gaps["covered_hrs"] = hrs
+    gaps["covered"] = [x < 0.5 for x in rem]
+    gaps["reason"] = gaps.apply(lambda r: r.note if r.kind == "Leave" else r.status, axis=1)
     return gaps.sort_values(["date", "shift_start", "name"])[out_cols].reset_index(drop=True)
 
 
@@ -1315,6 +1496,20 @@ def page_coverage(acct):
         day = pre["day"]
         st.markdown(f"**Finding cover for {pre['label']} on {day:%A, %b %d}**")
     pre_key = f"{pre['for']}_{day}"
+    done = []
+    if pre["for"]:
+        done, left, _gw = gap_cover_status(day, pre["for"], pre["start"], pre["end"])
+        if done:
+            st.info("Already covered: " + " · ".join(f"**{n}** {_fmt_win(a, b)}" for a, b, n in done)
+                    + ("" if left else " — this gap is fully covered."))
+            if left:
+                pre["start"], pre["end"] = f"{left[0][0]:%H:%M}", f"{left[0][1]:%H:%M}"
+                if len(left) > 1:
+                    st.caption("Still open: " + ", ".join(_fmt_win(a, b) for a, b in left)
+                               + " — search each window in turn.")
+            else:
+                return
+        pre_key += "_" + "_".join(f"{a:%H%M}" for a, b, n in done)
 
     c = st.columns(4)
     account = c[0].selectbox("Account to cover", accts, index=accts.index(pre["account"])
@@ -1325,35 +1520,76 @@ def page_coverage(acct):
     if not (re.fullmatch(TIME_RE, ns) and re.fullmatch(TIME_RE, ne) and ns and ne):
         st.error("Enter times as HH:MM.")
         return
-    excl = (pre["for"],) if pre["for"] else ()
+    excl = tuple(x for x in [pre["for"]] if x)
+    excl += tuple(int(r) for r in q("SELECT DISTINCT agent_id FROM ot_requests WHERE covering_for=? AND "
+                                    "status!='Denied' AND reason LIKE ?", (pre["for"], f"%[gap {day}]%")).agent_id) \
+        if pre["for"] else ()
     res = find_coverage(day, ns, ne, account, skill, excl)
     if res.empty:
         st.info("No agents to evaluate.")
         return
-    only = st.toggle("Show eligible only", True)
-    view = res[res.eligible] if only else res
-    st.caption(f"Ranked by: same account > skill match > same LOB > shift extension, minus OT already done this week. "
-               f"Rules: min rest {setting('min_rest_hrs'):g}h · max {setting('max_daily_hrs'):g}h/day · "
-               f"OT cap {setting('max_weekly_ot_hrs'):g}h/week.")
-    st.dataframe(view.drop(columns=["agent_id"]), hide_index=True, width="stretch")
-    elig = res[res.eligible]
-    if elig.empty:
-        st.warning("Nobody passes the rules. Try a shorter window (split cover), relax settings, or check other accounts.")
+    ws_, we_ = shift_window(day, ns, ne)
+    need_h = (we_ - ws_).total_seconds() / 3600
+    n_full, n_part = int((res.can_cover == "Full").sum()), int((res.can_cover == "Partial").sum())
+    k = st.columns(3)
+    k[0].metric("Window", f"{ns}–{ne}", f"{need_h:g}h", delta_color="off")
+    k[1].metric("Can cover all of it", n_full)
+    k[2].metric("Can cover part of it", n_part)
+    only = st.toggle("Show only agents who can cover (all or part)", True, key="cov_only")
+    view = res[res.can_cover != "No"] if only else res
+    st.caption(f"**Can cover** = Full, Partial (the longest part they can legally take, in 30-min steps, at least "
+               f"{max(0.5, setting('ot_min_block_hrs')):g}h) or No. Ranked: full first, then most hours, then same "
+               f"account > skill > same LOB > shift extension, minus OT already done this week. Rules: min rest "
+               f"{setting('min_rest_hrs'):g}h · max {setting('max_daily_hrs'):g}h/day · OT cap "
+               f"{setting('max_weekly_ot_hrs'):g}h/week.")
+    show_cols = ["name", "can_cover", "cover_window", "cover_hrs", "cover_type", "today", "account", "skills",
+                 "ot_this_week", "score", "why_not"]
+    st.dataframe(view[show_cols], hide_index=True, width="stretch", column_config={
+        "can_cover": "Can cover", "cover_window": "Can take", "cover_hrs": st.column_config.NumberColumn(
+            "Hours", format="%.1f"), "why_not": "Why not (whole window)"})
+    able = res[res.can_cover != "No"]
+    if able.empty:
+        st.warning("Nobody can take any part of this window. Relax the rules in Settings or check other accounts.")
         return
-    lbl = {int(r.agent_id): f"{r.name} · {r.cover_type} · {r.account}" for r in elig.itertuples()}
+
+    if n_full == 0:
+        plan, still = split_cover_plan(day, ns, ne, account, skill, excl)
+        st.subheader("🧩 Suggested split cover")
+        if plan:
+            names = dict(zip(res.agent_id.astype(int), res.name))
+            ptab = pd.DataFrame([{"agent": names.get(p["agent_id"], p["agent_id"]), "from": f"{p['start']:%H:%M}",
+                                  "to": f"{p['end']:%H:%M}",
+                                  "hours": round((p["end"] - p["start"]).total_seconds() / 3600, 2),
+                                  "type": "Pre/Post-shift OT" if p["adjacent"] else
+                                  res.set_index("agent_id").cover_type.get(p["agent_id"])} for p in plan])
+            got = ptab.hours.sum()
+            st.caption(f"Nobody can take the whole {need_h:g}h, but these {len(plan)} agent(s) together cover "
+                       f"**{got:g}h of {need_h:g}h**."
+                       + (" Still open: " + ", ".join(_fmt_win(a, b) for a, b in still) if still else " ✅ Fully covered."))
+            st.dataframe(ptab, hide_index=True, width="stretch")
+            if st.button(f"Assign this split cover ({len(plan)} OT records)", type="primary", key=f"cov_split_{pre_key}"):
+                for p_ in plan:
+                    ctype = ptab.type[plan.index(p_)]
+                    assign_cover(p_["agent_id"], p_["start"], p_["end"], pre["for"], pre["label"], account, day, ctype)
+                st.success(f"Split cover assigned — {got:g}h across {len(plan)} agents.")
+                rerun()
+        else:
+            st.caption("No combination of agents covers any part of this window.")
+        st.markdown("**Or assign one agent**")
+
+    lbl = {int(r.agent_id): f"{r.name} · {r.can_cover} {r.cover_window} ({r.cover_hrs:g}h) · {r.cover_type}"
+           for r in able.itertuples()}
     cid = st.selectbox("Assign", list(lbl), format_func=lbl.get, key=f"cov_assign_{pre_key}")
-    if st.button("Assign coverage (creates approved OT)", type="primary"):
-        row = elig[elig.agent_id == cid].iloc[0]
-        s, e = shift_window(day, ns, ne)
-        hrs = round((e - s).total_seconds() / 3600, 2)
-        ex("INSERT INTO ot_requests(agent_id,date,ot_type,start_time,end_time,hours,reason,status,covering_for,filed_on) "
-           "VALUES(?,?,?,?,?,?,?,?,?,?)", (cid, str(day), "Coverage OT", ns, ne, hrs,
-                                          f"{row.cover_type} covering {pre['label']} ({account})", "Approved",
-                                          pre["for"], str(today_site())))
-        if row.cover_type == "Rest Day OT":
-            ex("INSERT OR REPLACE INTO schedule_overrides VALUES(?,?,?,?,?,?)",
-               (cid, str(day), "Work (RD OT)", ns, ne, f"Covering {pre['label']}"))
-        st.success(f"{row['name']} assigned — {hrs:g}h OT logged.")
+    row = able[able.agent_id == cid].iloc[0]
+    if st.button(f"Assign {row['name']} {row.cover_window} (creates approved OT)", type="primary",
+                 key=f"cov_one_{pre_key}"):
+        hrs = assign_cover(cid, row._s.to_pydatetime() if hasattr(row._s, "to_pydatetime") else row._s,
+                           row._e.to_pydatetime() if hasattr(row._e, "to_pydatetime") else row._e,
+                           pre["for"], pre["label"], account, day, row.cover_type)
+        msg = f"{row['name']} assigned {row.cover_window} — {hrs:g}h OT logged."
+        if row.can_cover == "Partial":
+            msg += " The rest of the window is still open — pick this gap again to cover it."
+        st.success(msg)
         rerun()
 
 
