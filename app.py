@@ -49,21 +49,38 @@ def secret(key):
     return None
 
 
-def _sheet_secrets():
+def _service_account():
+    """The Google key: either the whole JSON key file pasted as gcp_json, or the [gcp_service_account] section."""
+    raw = secret("gcp_json")
+    if raw:
+        try:
+            info = json.loads(str(raw).strip())
+        except ValueError as e:
+            st.error("The `gcp_json` in your Secrets isn't valid. Paste the **entire** contents of the Google key "
+                     f"file between the three quote marks `\'\'\'` — from the first `{{` to the last `}}`. ({e})")
+            st.stop()
+        if info.get("type") != "service_account" or "private_key" not in info:
+            st.error("The `gcp_json` in your Secrets doesn't look like a Google service-account key file.")
+            st.stop()
+        return info
     try:
-        has_key = "gcp_service_account" in st.secrets
+        if "gcp_service_account" in st.secrets:
+            return {k: v for k, v in dict(st.secrets["gcp_service_account"]).items()
+                    if k not in ("sheet_url", "sheet_key", "setup_code")}
     except Exception:
-        return None
-    if not has_key:
+        pass
+    return None
+
+
+def _sheet_secrets():
+    sa = _service_account()
+    if sa is None:
         return None
     url, key = secret("sheet_url"), secret("sheet_key")
     if not (url or key):
         st.error("Your Secrets have the Google key but no `sheet_url`. Add `sheet_url = \"https://docs.google.com/"
-                 "spreadsheets/d/...\"` at the very top of Secrets (above `[gcp_service_account]`). "
-                 "Nothing is being saved until then.")
+                 "spreadsheets/d/...\"` as the first line of Secrets. Nothing is being saved until then.")
         st.stop()
-    sa = {k: v for k, v in dict(st.secrets["gcp_service_account"]).items()
-          if k not in ("sheet_url", "sheet_key", "setup_code")}
     return {"gcp_service_account": sa, **({"sheet_url": url} if url else {"sheet_key": key})}
 
 
