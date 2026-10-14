@@ -853,22 +853,35 @@ def find_coverage(day, need_start, need_end, account, skill="", exclude=()):
     return df.sort_values(["eligible", "score"], ascending=[False, False]).reset_index(drop=True)
 
 
-def open_gaps(day, account=None):
-    """Leaves + absences on `day` that have no coverage assigned yet."""
-    sch = build_schedule(day, day, account)
-    att = q("SELECT agent_id, status FROM attendance WHERE date=?", (str(day),))
-    m = sch.merge(att, on="agent_id", how="left")
+def open_gaps_range(d1, d2, account=None):
+    """Leaves + absences between d1 and d2 (inclusive), with whether cover is assigned yet."""
+    out_cols = ["date", "agent_id", "name", "account", "lob", "shift_start", "shift_end", "reason", "covered"]
+    sch = build_schedule(d1, d2, account)
+    if sch.empty:
+        return pd.DataFrame(columns=out_cols)
+    sch["date"] = sch["date"].astype(str)
+    att = q("SELECT agent_id, date, status FROM attendance WHERE date BETWEEN ? AND ?", (str(d1), str(d2)))
+    att["date"] = att["date"].astype(str)
+    m = sch.merge(att, on=["agent_id", "date"], how="left")
     ag = agents_df(True)[["id", "shift_start", "shift_end"]].rename(
         columns={"id": "agent_id", "shift_start": "def_start", "shift_end": "def_end"})
     m = m.merge(ag, on="agent_id", how="left")
     gaps = m[(m.kind == "Leave") | ((m.kind == "Work") & m.status.isin(ABSENT_STATUS))].copy()
-    covered = q("SELECT covering_for FROM ot_requests WHERE date=? AND status!='Denied' "
-                "AND covering_for IS NOT NULL", (str(day),)).covering_for.astype(int).tolist()
-    gaps["covered"] = gaps.agent_id.isin(covered)
+    if gaps.empty:
+        return pd.DataFrame(columns=out_cols)
+    cov = q("SELECT date, covering_for FROM ot_requests WHERE date BETWEEN ? AND ? AND status!='Denied' "
+            "AND covering_for IS NOT NULL", (str(d1), str(d2)))
+    covered = {(str(r.date), int(r.covering_for)) for r in cov.itertuples()}
+    gaps["covered"] = [(d, int(a)) in covered for d, a in zip(gaps.date, gaps.agent_id)]
     gaps["reason"] = gaps.apply(lambda r: r.note if r.kind == "Leave" else r.status, axis=1)
     gaps["shift_start"] = gaps.shift_start.fillna(gaps.def_start)
     gaps["shift_end"] = gaps.shift_end.fillna(gaps.def_end)
-    return gaps[["agent_id", "name", "account", "lob", "shift_start", "shift_end", "reason", "covered"]]
+    return gaps.sort_values(["date", "shift_start", "name"])[out_cols].reset_index(drop=True)
+
+
+def open_gaps(day, account=None):
+    """Leaves + absences on `day` that have no coverage assigned yet."""
+    return open_gaps_range(day, day, account).drop(columns="date")
 
 
 def style_kinds(df):
@@ -1241,31 +1254,73 @@ def page_leaves(acct):
 
 def page_coverage(acct):
     st.header("🧩 Coverage Finder")
-    day = st.date_input("Date needing coverage", today_site(), key="cov_day")
-    gaps = open_gaps(day, acct)
     accts = account_names()
     if not accts:
         st.info("Set up accounts first.")
         return
-    pre = {"account": accts[0], "start": "22:00", "end": "07:00", "for": None, "label": "Manual"}
+    c = st.columns([1.3, 2])
+    view_by = c[0].radio("View gaps by", ["Week", "Month", "Day"], horizontal=True, key="cov_view")
+    today = today_site()
+    if view_by == "Week":
+        wk = c[1].date_input("Week of (Mon–Sun)", today, key="cov_week")
+        d1 = week_start(wk)
+        d2 = d1 + 6 * ONE_DAY
+    elif view_by == "Month":
+        base = today.year * 12 + today.month - 1
+        months = [dt.date((base + i) // 12, (base + i) % 12 + 1, 1) for i in range(-6, 4)]
+        m0 = c[1].selectbox("Month", months, index=months.index(today.replace(day=1)),
+                            format_func=lambda m: m.strftime("%B %Y"), key="cov_month")
+        d1 = m0
+        d2 = (m0 + dt.timedelta(days=32)).replace(day=1) - ONE_DAY
+    else:
+        d1 = d2 = c[1].date_input("Date needing coverage", today, key="cov_day")
+
+    gaps = open_gaps_range(d1, d2, acct)
+    pre = {"account": accts[0], "start": "22:00", "end": "07:00", "for": None, "label": "Manual", "day": d1}
+    period = d1.strftime("%b %d") if d1 == d2 else f"{d1:%b %d} – {d2:%b %d, %Y}"
     if len(gaps):
-        st.subheader("Gaps on this date")
-        st.dataframe(gaps.drop(columns="agent_id"), hide_index=True, width="stretch")
-        opts = {int(r.agent_id): f"{r.name} · {r.reason} · {r.shift_start}-{r.shift_end}"
-                + (" ✅ covered" if r.covered else "") for r in gaps.itertuples()}
-        pick = st.selectbox("Find cover for", [None] + list(opts),
+        n_open = int((~gaps.covered).sum())
+        k = st.columns(3)
+        k[0].metric("Gaps", len(gaps))
+        k[1].metric("Still need cover", n_open)
+        k[2].metric("Covered", len(gaps) - n_open)
+        open_only = st.toggle("Show only gaps that still need cover", n_open > 0, key="cov_open_only")
+        shown = gaps[~gaps.covered] if open_only else gaps
+        st.subheader(f"Gaps · {period}")
+        tbl = shown.drop(columns="agent_id").copy()
+        tbl.insert(1, "day", pd.to_datetime(tbl.date).dt.strftime("%a"))
+        st.dataframe(tbl, hide_index=True, width="stretch")
+        if d1 != d2 and len(gaps):
+            per_day = gaps.assign(open=~gaps.covered).groupby("date").agg(gaps=("name", "size"), open=("open", "sum"))
+            with st.expander("Gaps per day"):
+                st.bar_chart(per_day[["open"]].rename(columns={"open": "still need cover"}))
+        opts = {(r.date, int(r.agent_id)): f"{pd.Timestamp(r.date):%a %b %d} · {r.name} · {r.reason} · "
+                f"{r.shift_start}-{r.shift_end}" + (" ✅ covered" if r.covered else "") for r in shown.itertuples()}
+        pick = st.selectbox("Find cover for", [None] + list(opts), key=f"cov_pick_{view_by}_{d1}",
                             format_func=lambda k: "— enter a window manually —" if k is None else opts[k])
         if pick:
-            g = gaps[gaps.agent_id == pick].iloc[0]
-            pre = {"account": g.account, "start": g.shift_start, "end": g.shift_end, "for": pick, "label": g["name"]}
+            g = gaps[(gaps.date == pick[0]) & (gaps.agent_id == pick[1])].iloc[0]
+            pre = {"account": g.account, "start": g.shift_start, "end": g.shift_end, "for": pick[1],
+                   "label": g["name"], "day": dt.date.fromisoformat(pick[0])}
     else:
-        st.caption("No leaves or absences recorded for this date — you can still search a window manually.")
+        st.caption(f"No leaves or absences recorded for {period} — you can still search a window manually.")
+
+    if pre["for"] is None:
+        if d1 == d2:
+            day = d1
+        else:
+            day = st.date_input("Date to cover (manual search)", min(max(today, d1), d2),
+                                min_value=d1, max_value=d2, key=f"cov_mday_{d1}")
+    else:
+        day = pre["day"]
+        st.markdown(f"**Finding cover for {pre['label']} on {day:%A, %b %d}**")
+    pre_key = f"{pre['for']}_{day}"
 
     c = st.columns(4)
     account = c[0].selectbox("Account to cover", accts, index=accts.index(pre["account"])
-                             if pre["account"] in accts else 0, key=f"cov_acc_{pre['for']}")
-    ns = c[1].text_input("Cover from (HH:MM)", pre["start"], key=f"cov_s_{pre['for']}")
-    ne = c[2].text_input("Cover to (HH:MM)", pre["end"], key=f"cov_e_{pre['for']}")
+                             if pre["account"] in accts else 0, key=f"cov_acc_{pre_key}")
+    ns = c[1].text_input("Cover from (HH:MM)", pre["start"], key=f"cov_s_{pre_key}")
+    ne = c[2].text_input("Cover to (HH:MM)", pre["end"], key=f"cov_e_{pre_key}")
     skill = c[3].text_input("Required skill (optional)", "", help="e.g. Billing, Tier 2, Spanish")
     if not (re.fullmatch(TIME_RE, ns) and re.fullmatch(TIME_RE, ne) and ns and ne):
         st.error("Enter times as HH:MM.")
@@ -1286,7 +1341,7 @@ def page_coverage(acct):
         st.warning("Nobody passes the rules. Try a shorter window (split cover), relax settings, or check other accounts.")
         return
     lbl = {int(r.agent_id): f"{r.name} · {r.cover_type} · {r.account}" for r in elig.itertuples()}
-    cid = st.selectbox("Assign", list(lbl), format_func=lbl.get)
+    cid = st.selectbox("Assign", list(lbl), format_func=lbl.get, key=f"cov_assign_{pre_key}")
     if st.button("Assign coverage (creates approved OT)", type="primary"):
         row = elig[elig.agent_id == cid].iloc[0]
         s, e = shift_window(day, ns, ne)
