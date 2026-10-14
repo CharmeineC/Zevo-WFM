@@ -14,6 +14,8 @@ Run:  streamlit run app.py
 """
 import datetime as dt
 import hashlib
+import inspect
+import json
 import hmac
 import math
 import os
@@ -34,17 +36,40 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 
-def _sheet_secrets():
+def secret(key):
+    """Read a top-level secret; also accept it if it was pasted inside the [gcp_service_account] section."""
     try:
-        if "gcp_service_account" in st.secrets and ("sheet_url" in st.secrets or "sheet_key" in st.secrets):
-            return st.secrets
+        if key in st.secrets:
+            return st.secrets[key]
+        sa = st.secrets.get("gcp_service_account")
+        if sa is not None and key in sa:
+            return sa[key]
     except Exception:  # no secrets file at all
         pass
     return None
 
 
+def _sheet_secrets():
+    try:
+        has_key = "gcp_service_account" in st.secrets
+    except Exception:
+        return None
+    if not has_key:
+        return None
+    url, key = secret("sheet_url"), secret("sheet_key")
+    if not (url or key):
+        st.error("Your Secrets have the Google key but no `sheet_url`. Add `sheet_url = \"https://docs.google.com/"
+                 "spreadsheets/d/...\"` at the very top of Secrets (above `[gcp_service_account]`). "
+                 "Nothing is being saved until then.")
+        st.stop()
+    sa = {k: v for k, v in dict(st.secrets["gcp_service_account"]).items()
+          if k not in ("sheet_url", "sheet_key", "setup_code")}
+    return {"gcp_service_account": sa, **({"sheet_url": url} if url else {"sheet_key": key})}
+
+
 SECRETS = _sheet_secrets()
 USE_SHEETS = SECRETS is not None
+ON_CLOUD = os.getcwd().startswith("/mount/src") or os.path.exists("/mount/src")  # Streamlit Community Cloud
 if USE_SHEETS:
     _sid = str(SECRETS.get("sheet_url") or SECRETS.get("sheet_key"))
     DB_PATH = os.path.join(tempfile.gettempdir(),
@@ -2325,37 +2350,66 @@ def logout_session():
     st.session_state["_signed_out"] = True  # don't re-read the old cookie in this browser tab
 
 
+def _page_js(code):
+    """Run a small script in the app page (used only for the sign-in key in the browser)."""
+    if "unsafe_allow_javascript" in inspect.signature(st.html).parameters:
+        st.html(f"<script>{code}</script>", unsafe_allow_javascript=True)
+    else:  # older Streamlit: run it from a component frame by injecting into the page
+        components.html("<script>(function(){const d = window.parent.document; const s = d.createElement('script');"
+                        f"s.text = {json.dumps(code)}; d.head.appendChild(s); s.remove();}})();</script>", height=0)
+
+
 def _cookie_js():
-    """Write or clear the sign-in cookie in the browser (Streamlit can read cookies but not set them)."""
-    js = None
+    """Save or clear the sign-in key in the browser: a cookie, plus local storage as a backup for hosts
+    that don't pass cookies through to the app."""
     if st.session_state.get("_cookie_set"):
         token, age = st.session_state.pop("_cookie_set")
-        js = f"'{SESSION_COOKIE}={token}; path=/; max-age={age}; SameSite=Lax'"
+        _page_js(f"document.cookie = '{SESSION_COOKIE}={token}; path=/; max-age={age}; SameSite=Lax'"
+                 " + (location.protocol === 'https:' ? '; Secure' : '');"
+                 f"try {{ localStorage.setItem('{SESSION_COOKIE}', JSON.stringify("
+                 f"{{t: '{token}', exp: Date.now() + {age * 1000}}})); }} catch (e) {{}}")
     elif st.session_state.pop("_cookie_clear", False):
-        js = f"'{SESSION_COOKIE}=; path=/; max-age=0; SameSite=Lax'"
-    if js:
-        components.html("<script>const d = window.parent.document; "
-                        f"d.cookie = {js} + (window.parent.location.protocol === 'https:' ? '; Secure' : '');"
-                        "</script>", height=0)
+        _page_js(f"document.cookie = '{SESSION_COOKIE}=; path=/; max-age=0; SameSite=Lax';"
+                 f"try {{ localStorage.removeItem('{SESSION_COOKIE}'); }} catch (e) {{}}")
+    elif not current_user() and not st.session_state.get("_signed_out") and not st.session_state.get("_ls_tried") \
+            and setting("remember_hrs") > 0:
+        # Backup path: the cookie didn't reach us, so ask the page for the saved key (reloads once with ?s=...).
+        st.session_state["_ls_tried"] = True
+        _page_js(f"try {{ const v = JSON.parse(localStorage.getItem('{SESSION_COOKIE}') || 'null');"
+                 "const u = new URL(location.href);"
+                 "if (v && v.t && v.exp > Date.now() && !u.searchParams.has('s')) {"
+                 "u.searchParams.set('s', v.t); location.replace(u.toString()); } } catch (e) {}")
+
+
+def _session_from_token(token):
+    h = _token_hash(token)
+    row = q("SELECT username, expires FROM sessions WHERE token_hash=?", (h,))
+    if row.empty or str(row.expires.iloc[0]) < now_site().isoformat():
+        return None, h
+    u = get_user(row.username.iloc[0])
+    if u is None or not int(u.get("active") or 0):
+        return None, h
+    return u, h
 
 
 def restore_from_cookie():
     """Sign back in after a page refresh using the browser's sign-in cookie."""
     if st.session_state.get("_signed_out") or setting("remember_hrs") <= 0:
         return False
+    token = None
     try:
-        token = st.context.cookies.get(SESSION_COOKIE)
+        if not os.environ.get("WFM_TEST_NO_COOKIES"):  # automated tests of the backup path only
+            token = st.context.cookies.get(SESSION_COOKIE)
     except Exception:
         token = None
+    from_url = st.query_params.get("s")
+    if from_url:
+        st.query_params.clear()  # take the key out of the address bar straight away
+        token = token or from_url
     if not token:
         return False
-    h = _token_hash(token)
-    row = q("SELECT username, expires FROM sessions WHERE token_hash=?", (h,))
-    if row.empty or str(row.expires.iloc[0]) < now_site().isoformat():
-        st.session_state["_cookie_clear"] = True
-        return False
-    u = get_user(row.username.iloc[0])
-    if u is None or not int(u.get("active") or 0):
+    u, h = _session_from_token(token)
+    if u is None:
         st.session_state["_cookie_clear"] = True
         return False
     start_session(u, sid=h)
@@ -2364,10 +2418,10 @@ def restore_from_cookie():
 
 def auth_gate():
     """Show the login (or first-admin setup) screen until someone is signed in."""
-    _cookie_js()
     u = current_user()
     if not u and restore_from_cookie():
         u = current_user()
+    _cookie_js()
     if u:
         fresh = get_user(u["username"])
         ended = u.get("sid") and q("SELECT 1 FROM sessions WHERE token_hash=?", (u["sid"],)).empty
@@ -2384,13 +2438,16 @@ def auth_gate():
     with mid:
         st.title("🗓️ WFM Scheduler")
         if n_admins == 0:
+            if not USE_SHEETS:
+                st.error("⚠️ **Not connected to Google Sheets.** This app is saving to a temporary file that is erased "
+                         "whenever the app restarts (every update, and after it sleeps) — so you'd keep landing on "
+                         "this screen. Add your Google key and `sheet_url` in the app's **Secrets** (see README), "
+                         "then come back." if ON_CLOUD else
+                         "Not connected to Google Sheets — data is saved in the local file `wfm.db` on this computer.")
             st.subheader("First-time setup: create the admin login")
             st.caption("No admin exists yet. Create the first admin now, then add other admins and agent logins "
                        "under **Users**.")
-            try:
-                setup_code = str(st.secrets.get("setup_code") or "")
-            except Exception:  # no secrets file at all
-                setup_code = ""
+            setup_code = str(secret("setup_code") or "")
             code_needed = bool(setup_code)
             with st.form("setup"):
                 un = st.text_input("Admin username")
@@ -3174,6 +3231,9 @@ with st.sidebar:
                 if flush_to_sheet(sync=True):
                     STORE.load()
                 st.rerun()
+        elif ON_CLOUD:
+            st.error("⚠️ Not connected to Google Sheets — all data (including logins) is erased whenever the app "
+                     "restarts. Add your Google key and `sheet_url` in the app's Secrets.")
         else:
             st.caption("💾 Saving to local file `wfm.db`")
 

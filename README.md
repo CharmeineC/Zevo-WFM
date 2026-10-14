@@ -181,6 +181,15 @@ Run the app — the sidebar shows **🟢 Google Sheet: WFM Data** when it's conn
 Because the data lives in Google Sheets, nothing is lost when the free app sleeps or restarts.
 (Without Google Sheets, the cloud app's local `wfm.db` is wiped on every restart — you'd have to download a backup from **Settings** each shift.)
 
+## Troubleshooting
+
+**It keeps asking me to create an admin / everyone has to sign in again.** The app isn't saving to Google Sheets, so everything is erased when Streamlit restarts it (after every GitHub update and when it wakes from sleep). Check:
+1. The admin sidebar says **🟢 Google Sheet: (your sheet name)**. A red "Not connected to Google Sheets" message means it's using a temporary file.
+2. In the app's **Secrets**, `sheet_url` is present (best at the very top, above `[gcp_service_account]`).
+3. The Google Sheet is shared with the service account's `client_email` as **Editor**, and it now has tabs named `users`, `sessions`, `agents`… After you create the admin, the `users` tab shows your username.
+
+**I get signed out when I refresh.** Make sure the latest `app.py` **and** `requirements.txt` are in GitHub (the app is tested on Streamlit 1.66, pinned in `requirements.txt`), and that the Google Sheet is connected (see above) — remembered sign-ins are stored in the `sessions` tab. Private/incognito windows forget the sign-in when closed.
+
 ## Getting your real data in
 
 1. **Roster & Accounts → Accounts**: add each account with LOB, channel (Voice / Chat / Email), service level target and shrinkage, and max % allowed off the same day.
