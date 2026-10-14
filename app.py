@@ -2490,17 +2490,24 @@ def auth_gate():
                         start_session(get_user(un.strip()))
                         st.rerun()
         else:
+            role = st.radio("Sign in as", ["🧑‍💼 Agent", "🛡️ Admin"], horizontal=True, key="login_role")
+            want = "admin" if "Admin" in role else "agent"
             with st.form("login"):
-                un = st.text_input("Username")
+                un = st.text_input("Username" if want == "admin" else "Employee ID",
+                                   placeholder="Admin username" if want == "admin" else "e.g. 10013")
                 pw = st.text_input("Password", type="password")
-                if st.form_submit_button("Sign in", type="primary", width="stretch"):
+                if st.form_submit_button(f"Sign in as {want.title()}", type="primary", width="stretch"):
                     user, err = authenticate(un, pw)
                     if err:
                         st.error(err)
+                    elif user["role"] != want:
+                        other = "Admin" if user["role"] == "admin" else "Agent"
+                        st.error(f"That's an {other.lower()} login — choose **{other}** above and sign in again.")
                     else:
                         start_session(user)
                         st.rerun()
-            st.caption("Forgot your password? Ask an admin to reset it.")
+            st.caption("Agents: log in, take breaks and file time off or OT. Admins: schedules, attendance and "
+                       "reports. Forgot your password? Ask an admin to reset it.")
     st.stop()
 
 
