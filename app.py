@@ -17,6 +17,7 @@ import hashlib
 import inspect
 import json
 import hmac
+import io
 import math
 import os
 import random
@@ -26,6 +27,7 @@ import sqlite3
 import tempfile
 import threading
 import time
+from collections import Counter
 from contextlib import closing
 from zoneinfo import ZoneInfo
 
@@ -94,7 +96,7 @@ if USE_SHEETS:
 else:
     DB_PATH = os.environ.get("WFM_DB", "wfm.db")
 TABLES = ["accounts", "agents", "schedule_overrides", "attendance", "leaves", "ot_requests", "settings",
-          "interval_volume", "users", "time_logs", "sessions"]
+          "interval_volume", "users", "time_logs", "sessions", "schedule_changes"]
 APPEND_TABLES = {"time_logs"}  # insert-only logs are appended to the sheet instead of rewriting the tab
 _WRITE_RE = re.compile(r"^\s*(?:INSERT(?:\s+OR\s+\w+)?\s+INTO|UPDATE|DELETE\s+FROM)\s+(\w+)", re.I)
 DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
@@ -169,6 +171,9 @@ CREATE TABLE IF NOT EXISTS users(
   username TEXT PRIMARY KEY, pw_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'agent', agent_id INTEGER,
   active INTEGER DEFAULT 1, must_change INTEGER DEFAULT 1, failed INTEGER DEFAULT 0, locked_until TEXT,
   last_login TEXT, created_on TEXT);
+CREATE TABLE IF NOT EXISTS schedule_changes(
+  agent_id INTEGER, effective_from TEXT, shift_start TEXT, shift_end TEXT, rest_days TEXT, note TEXT,
+  PRIMARY KEY(agent_id, effective_from));
 CREATE TABLE IF NOT EXISTS sessions(
   token_hash TEXT PRIMARY KEY, username TEXT, created TEXT, expires TEXT);
 CREATE TABLE IF NOT EXISTS time_logs(
@@ -587,23 +592,34 @@ def build_schedule(start, end, account=None, agent_id=None):
     if ag.empty:
         return pd.DataFrame(columns=cols)
     s, e = str(start), str(end)
+    vers = q("SELECT agent_id, effective_from, shift_start, shift_end, rest_days FROM schedule_changes "
+             "WHERE effective_from<=? ORDER BY effective_from", (e,))
+    vmap = {}
+    for r in vers.itertuples():
+        vmap.setdefault(int(r.agent_id), []).append((r.effective_from, r.shift_start, r.shift_end, r.rest_days))
     ov = q("SELECT * FROM schedule_overrides WHERE date BETWEEN ? AND ?", (s, e))
     ovmap = {(int(r.agent_id), r.date): r for r in ov.itertuples()}
     lv = q("SELECT agent_id, leave_type, start_date, end_date FROM leaves "
            "WHERE status='Approved' AND start_date<=? AND end_date>=?", (e, s))
     rows = []
     for a in ag.itertuples():
-        rds = rest_set(a.rest_days)
+        base = (a.shift_start, a.shift_end, a.rest_days)
+        versions = vmap.get(int(a.id), [])
         mine = lv[lv.agent_id == a.id]
         for d in pd.date_range(start, end).date:
             ds = d.isoformat()
+            ss0, se0, rd0 = base
+            for eff, vs, ve, vr in versions:  # permanent schedule in effect on this date
+                if eff <= ds:
+                    ss0, se0, rd0 = vs, ve, vr
+            rds = rest_set(rd0)
             if (a.id, ds) in ovmap:
                 o = ovmap[(a.id, ds)]
                 kind, ss, se, note = o.kind, o.shift_start, o.shift_end, o.note or ""
             elif DAYS[d.weekday()] in rds:
                 kind, ss, se, note = "Rest Day", None, None, ""
             else:
-                kind, ss, se, note = "Work", a.shift_start, a.shift_end, ""
+                kind, ss, se, note = "Work", ss0, se0, ""
             hit = mine[(mine.start_date <= ds) & (mine.end_date >= ds)]
             if len(hit) and kind in WORK_KINDS:
                 kind, note = "Leave", hit.iloc[0].leave_type
@@ -611,6 +627,34 @@ def build_schedule(start, end, account=None, agent_id=None):
                              lob=a.lob, skills=a.skills or "", date=ds, kind=kind,
                              shift_start=ss, shift_end=se, note=note))
     return pd.DataFrame(rows, columns=cols)
+
+
+def set_permanent_schedule(agent_id, effective_from, shift_start, shift_end, rest_days, note=""):
+    """Change an agent's permanent schedule from a date on. Earlier dates keep the old schedule."""
+    eff = str(effective_from)
+    have = q("SELECT 1 FROM schedule_changes WHERE agent_id=?", (agent_id,))
+    if have.empty:  # remember the schedule that applied until now
+        cur = q("SELECT shift_start, shift_end, rest_days FROM agents WHERE id=?", (agent_id,))
+        if len(cur):
+            ex("INSERT OR REPLACE INTO schedule_changes VALUES(?,?,?,?,?,?)",
+               (agent_id, "2000-01-01", cur.shift_start[0], cur.shift_end[0], cur.rest_days[0], "original"))
+    ex("INSERT OR REPLACE INTO schedule_changes VALUES(?,?,?,?,?,?)",
+       (agent_id, eff, shift_start, shift_end, rest_days, note))
+    sync_current_schedules()
+
+
+def sync_current_schedules():
+    """Keep the roster's shift columns showing the permanent schedule in effect today."""
+    today = str(today_site())
+    cur = q("SELECT c.agent_id, c.shift_start, c.shift_end, c.rest_days FROM schedule_changes c "
+            "JOIN (SELECT agent_id, MAX(effective_from) eff FROM schedule_changes WHERE effective_from<=? "
+            "GROUP BY agent_id) m ON m.agent_id=c.agent_id AND m.eff=c.effective_from", (today,))
+    ag = q("SELECT id, shift_start, shift_end, rest_days FROM agents")
+    now = {int(r.id): (r.shift_start, r.shift_end, r.rest_days) for r in ag.itertuples()}
+    for r in cur.itertuples():
+        want = (r.shift_start, r.shift_end, r.rest_days)
+        if now.get(int(r.agent_id)) != want:
+            ex("UPDATE agents SET shift_start=?, shift_end=?, rest_days=? WHERE id=?", (*want, int(r.agent_id)))
 
 
 def compute_attendance(day, shift_start, shift_end, time_in, time_out, status):
@@ -950,7 +994,8 @@ def page_schedule(acct):
     w0 = week_start(pick)
     sch = build_schedule(w0, w0 + 6 * ONE_DAY, acct)
     if sch.empty:
-        st.info("No agents in this view.")
+        st.info("No agents in this view yet — import your team schedule below.")
+        page_schedule_import(acct)
         return
     sch["cell"] = [cell_label(r) for r in sch.itertuples()]
     sch["day"] = [f"{DAYS[dt.date.fromisoformat(d).weekday()]} {d[5:]}" for d in sch.date]
@@ -960,11 +1005,19 @@ def page_schedule(acct):
     st.caption("Grey = rest day · Red = leave · Blue = RD OT · Yellow = training · Purple = holiday")
 
     working = sch[sch.kind.isin(("Work", "Work (RD OT)"))].groupby("day").size().reindex(order, fill_value=0)
-    st.bar_chart(working.rename("Agents on shift"))
+    wdf = working.rename("agents").reset_index()
+    st.altair_chart(alt.Chart(wdf).mark_bar(color="#4c78a8").encode(
+        x=alt.X("day:N", sort=order, title=None), y=alt.Y("agents:Q", title="Agents on shift"),
+        tooltip=["day", "agents"]), width="stretch", height=220)
 
     ag = agents_df(True, acct)
     labels = agent_label_map(ag)
-    t1, t2, t3 = st.tabs(["Change a schedule", "Shift swap", "Current overrides"])
+    t1, t2, t3, t4, t5 = st.tabs(["Change a schedule (one-off)", "Shift swap", "Current overrides",
+                                  "🔁 Permanent change", "📥 Import schedule"])
+    with t4:
+        page_permanent_change(acct)
+    with t5:
+        page_schedule_import(acct)
     with t1:
         with st.form("override"):
             ids = st.multiselect("Agent(s)", list(labels), format_func=labels.get)
@@ -1916,6 +1969,22 @@ def plan_ot(account, day, adj_pct=0.0, weeks=None, include_other=False, skill=""
     return plan, curve, used
 
 
+def intercom_export(df):
+    return {"Conversation ID", "Created at", "Inbound/Outbound"} <= set(df.columns)
+
+
+def intercom_to_rows(df, channels=None):
+    """One row per handled inbound conversation, ready for normalize_volume."""
+    keep = df["Inbound/Outbound"].astype(str).str.lower().eq("inbound")
+    if "Team assigned to (name)" in df:
+        keep &= ~df["Team assigned to (name)"].astype(str).str.lower().eq("duplicate")
+    if "Teammate replies" in df:
+        keep &= pd.to_numeric(df["Teammate replies"], errors="coerce").fillna(0) > 0
+    if channels is not None and "Channel" in df:
+        keep &= df["Channel"].astype(str).isin(channels)
+    return pd.DataFrame({"datetime": df.loc[keep, "Created at"].astype(str), "volume": 1})
+
+
 def normalize_volume(df, source_tz, site_tz, default_aht):
     """Map an ACD/chat export to (date, interval, volume, aht) in site time, 30-min buckets."""
     cols = {c.lower().strip().replace(" ", "_"): c for c in df.columns}
@@ -2222,10 +2291,21 @@ def page_interval(acct):
                                 index=COMMON_TZ.index("America/Chicago"), key="iv_src_tz",
                                 help="US client reports are usually in the client's time; daylight saving is handled")
         def_aht = c[2].number_input("AHT (s) if not in file", 1.0, 36000.0, 360.0, key="iv_def_aht")
+        st.caption("**Intercom:** you can upload the raw Intercom conversation export as-is — it's counted per 30 "
+                   "minutes automatically (inbound only, duplicates and conversations no teammate replied to are left "
+                   "out). Do this once a week with the previous week's export.")
         up = st.file_uploader("Volume CSV", type=["csv"], key="iv_file")
         if up is not None:
             try:
-                raw = pd.read_csv(up)
+                raw = pd.read_csv(up, low_memory=False)
+                if intercom_export(raw):
+                    chans = sorted(raw["Channel"].dropna().astype(str).unique())
+                    pick = st.multiselect("Intercom channels for this account", chans, key="iv_ic_ch",
+                                          default=[c for c in chans if c.lower() != "phone call"] or chans,
+                                          help="E.g. leave out Phone call for a messaging account, and upload the "
+                                               "same file again with only Phone call for the phone account")
+                    raw = intercom_to_rows(raw, pick)
+                    st.caption(f"Intercom export detected: {len(raw):,} conversations counted.")
                 site_tz = setting_str("site_tz")
                 acc_col = next((c for c in raw.columns if c.lower().strip() == "account"), None)
                 parts = raw.groupby(raw[acc_col].astype(str)) if acc_col else [(up_acc, raw)]
@@ -2268,6 +2348,351 @@ def page_interval(acct):
                        (del_acc, str(d1), str(d2)))
                     st.session_state.pop("ot_plan", None)
                     rerun()
+
+
+# ----------------------------------------------------------------- schedule grid import
+_LOOKALIKE = str.maketrans({"А": "A", "а": "a", "Р": "P", "р": "p", "М": "M", "м": "m", " ": " "})
+_TIME_RX = re.compile(r"(\d{1,4})(?::(\d{2}))?(?::\d{2})?\s*([AP])\.?\s*M\b", re.I)
+_LEAVE_WORDS = [("EMERGENCY", "Emergency (EL)"), ("SICK", "Sick (SL)"), ("BEREAVE", "Bereavement (BL)"),
+                ("LEAVE", "Planned Time Off (PTO)"), ("VL", "Planned Time Off (PTO)"), ("PTO", "Planned Time Off (PTO)")]
+
+
+def _hhmm(num, minutes, ampm):
+    num = str(num)
+    if not minutes and len(num) > 2:  # 230PM -> 2:30 PM, 1130AM -> 11:30 AM
+        num, minutes = num[:-2], num[-2:]
+    h, m = int(num), int(minutes or 0)
+    if not (1 <= h <= 12 and 0 <= m < 60):
+        return None
+    h = h % 12 + (12 if ampm.upper() == "P" else 0)
+    return f"{h:02d}:{m:02d}"
+
+
+def _block_times(text):
+    return [t for t in (_hhmm(n, m, ap) for n, m, ap in _TIME_RX.findall(text)) if t]
+
+
+def parse_schedule_cell(raw, default_hours=8):
+    """Read one cell of the team schedule. Returns (entry, warning).
+    entry: None (not scheduled) | ("rest",) | ("leave", type) | ("work"|"training", start, end)."""
+    text = str(raw or "").translate(_LOOKALIKE).strip()
+    up = text.upper()
+    if not text:
+        return None, None
+    if up in ("RD", "OFF", "REST DAY", "DAY OFF"):
+        return ("rest",), None
+    kind = "training" if "TRAINING" in up else "work"
+    blocks = [b for b in re.split(r"[|;&]| AND ", text, flags=re.I) if b.strip()]
+    parsed = []
+    for b in blocks:
+        ts = _block_times(b)
+        if not ts:
+            continue
+        start = ts[0]
+        end = ts[1] if len(ts) > 1 else None
+        if end is None:
+            s_dt = dt.datetime.strptime(start, "%H:%M")
+            end = (s_dt + dt.timedelta(hours=default_hours)).strftime("%H:%M")
+        parsed.append((start, end, len(ts)))
+    leave = next((name for word, name in _LEAVE_WORDS if re.search(rf"\b{word}\b", up)), None)
+    if not parsed:
+        if leave:
+            return ("leave", leave), None
+        if kind == "training":
+            return ("training", None, None), None
+        return None, f"couldn't read '{text}'"
+    warn = None
+
+    def length(se):
+        s_, e_ = shift_window(dt.date(2000, 1, 1), se[0], se[1])
+        return (e_ - s_).total_seconds() / 3600
+    if len(parsed) > 1:
+        warn = f"'{text}' has {len(parsed)} blocks; only one shift per day is supported, kept the longest"
+    best = max(parsed, key=length)
+    if best[2] > 2:
+        warn = f"'{text}' has more than two times; used {best[0]}–{best[1]}"
+    if length(best) > 16:
+        s_dt = dt.datetime.strptime(best[0], "%H:%M")
+        best = (best[0], (s_dt + dt.timedelta(hours=default_hours)).strftime("%H:%M"), best[2])
+        warn = f"'{text}' looks longer than 16h; used {best[0]}–{best[1]}"
+    if leave:
+        warn = (warn + "; " if warn else "") + f"'{text}' mixes a shift and leave; kept the shift"
+    return (kind, best[0], best[1]), warn
+
+
+def _slug(name):
+    return re.sub(r"[^a-z0-9]+", ".", str(name).strip().lower()).strip(".")
+
+
+def read_schedule_grid(df, year):
+    """Turn the team schedule sheet (dates down, people across) into {name: {date: cell}}."""
+    raw = df.astype(str).replace({"nan": "", "None": ""}).values.tolist()
+    hdr_i = next((i for i, r in enumerate(raw[:15]) if str(r[0]).strip().upper() == "DATE"), None)
+    if hdr_i is None:
+        raise ValueError("Couldn't find the header row starting with DATE.")
+    hdr = [str(h).strip() for h in raw[hdr_i]]
+    people = [(j, h) for j, h in enumerate(hdr) if j >= 2 and h and h.upper() not in ("DATE", "DAY")]
+    grid, last_month = {}, None
+    for r in raw[hdr_i + 1:]:
+        cell0 = str(r[0]).strip() if r else ""
+        if not cell0:
+            continue
+        try:
+            d = dt.datetime.strptime(f"{cell0} {year}", "%b %d %Y").date()
+        except ValueError:
+            try:
+                d = pd.to_datetime(cell0).date()
+            except Exception:
+                continue
+        for j, name in people:
+            grid.setdefault(name.title(), {})[d] = r[j] if j < len(r) else ""
+    if not grid:
+        raise ValueError("No dated rows found under the header.")
+    return grid
+
+
+def plan_schedule_import(grid, start, end, default_hours=8):
+    """From the grid, work out for each person:
+    - their permanent schedule (usual shift + days off), with a new version whenever the pattern changes for
+      2+ weeks in a row (e.g. a shift change from Nov 2),
+    - one-off changes on single dates, approved time off, and training.
+    Blank cells after someone's last filled-in date mean "not scheduled yet" and are ignored."""
+    plan = {"people": [], "exceptions": [], "leaves": [], "warnings": []}
+    for name, days in grid.items():
+        parsed = {}
+        for d, raw in days.items():
+            entry, warn = parse_schedule_cell(raw, default_hours)
+            parsed[d] = entry
+            if warn and start <= d <= end:
+                plan["warnings"].append(f"{name} {d:%b %d}: {warn}")
+        filled = [d for d, e in parsed.items() if e is not None]
+        if not filled:
+            continue
+        last = min(max(filled), end)
+        rng = [d for d in sorted(parsed) if start <= d <= last]
+        if not any(parsed[d] and parsed[d][0] in ("work", "training", "leave") for d in rng):
+            continue
+        # weekly signature: (usual shift, days off)
+        weeks = {}
+        for d in rng:
+            weeks.setdefault(week_start(d), []).append(d)
+        sigs = []
+        for w0, ds in sorted(weeks.items()):
+            work = Counter((parsed[d][1], parsed[d][2]) for d in ds if parsed[d] and parsed[d][0] == "work")
+            off = frozenset(DAYS[d.weekday()] for d in ds if parsed[d] is None or parsed[d][0] == "rest")
+            full = len(ds) == 7
+            sigs.append((w0, work.most_common(1)[0][0] if work else None, off if full else None))
+        # fill partial weeks with the neighbouring full week's days off
+        known = [x for x in sigs if x[1] and x[2] is not None]
+        if not known:
+            any_work = Counter((e[1], e[2]) for e in parsed.values() if e and e[0] == "work")
+            if not any_work:
+                continue
+            known = [(sigs[0][0], any_work.most_common(1)[0][0], frozenset())]
+        first_sig = Counter((x[1], x[2]) for x in known[:4]).most_common(1)[0][0]  # one odd week doesn't count
+        versions = [(start, first_sig[0], first_sig[1])]
+        i = next(k for k, x in enumerate(known) if (x[1], x[2]) == first_sig)
+        while i < len(known):
+            w0, shift, off = known[i]
+            cur = versions[-1]
+            if (shift, off) != (cur[1], cur[2]):
+                nxt = known[i + 1] if i + 1 < len(known) else None
+                if nxt and (nxt[1], nxt[2]) == (shift, off) and (nxt[0] - w0).days == 7:
+                    versions.append((max(w0, start), shift, off))
+            i += 1
+
+        def pattern_on(d):
+            v = [x for x in versions if x[0] <= d]
+            return v[-1] if v else versions[0]
+        plan["people"].append(dict(
+            name=name, username=_slug(name), shift_start=versions[0][1][0], shift_end=versions[0][1][1],
+            rest_days=",".join(x for x in DAYS if x in versions[0][2]), last_scheduled=last,
+            versions=[(v[0], v[1][0], v[1][1], ",".join(x for x in DAYS if x in v[2])) for v in versions]))
+        for d in rng:
+            e = parsed[d]
+            _, (ss, se), off = pattern_on(d)
+            is_rest_day = DAYS[d.weekday()] in off
+            if e is None or e[0] == "rest":
+                if not is_rest_day:
+                    plan["exceptions"].append(dict(name=name, date=d, kind="Rest Day", start=None, end=None))
+            elif e[0] == "leave":
+                plan["leaves"].append(dict(name=name, date=d, type=e[1]))
+            elif e[0] == "training":
+                plan["exceptions"].append(dict(name=name, date=d, kind="Training", start=e[1] or ss, end=e[2] or se))
+            elif is_rest_day or (e[1], e[2]) != (ss, se):
+                plan["exceptions"].append(dict(name=name, date=d, kind="Work", start=e[1], end=e[2]))
+    merged = []
+    for lv in sorted(plan["leaves"], key=lambda x: (x["name"], x["date"])):
+        if merged and merged[-1]["name"] == lv["name"] and merged[-1]["type"] == lv["type"] \
+                and (lv["date"] - merged[-1]["end"]).days == 1:
+            merged[-1]["end"] = lv["date"]
+        else:
+            merged.append(dict(name=lv["name"], start=lv["date"], end=lv["date"], type=lv["type"]))
+    plan["leaves"] = merged
+    return plan
+
+
+def apply_schedule_import(plan, start, end, account, lob, deactivate=()):
+    """Write the plan: agents (new or updated), permanent schedules from `start`, exceptions and time off."""
+    ag = q("SELECT id, emp_id, name FROM agents")
+    by_name = {str(n).strip().lower(): int(i) for i, n in zip(ag.id, ag.name)}
+    by_emp = {str(e).strip().lower(): int(i) for i, e in zip(ag.id, ag.emp_id)}
+    ids, created = {}, 0
+    for p in plan["people"]:
+        aid = by_name.get(p["name"].lower()) or by_emp.get(p["username"])
+        if aid is None:
+            aid = ex("INSERT INTO agents(emp_id,name,account,lob,shift_start,shift_end,rest_days,active) "
+                     "VALUES(?,?,?,?,?,?,?,?)", (p["username"], p["name"], account, lob, p["shift_start"],
+                                                 p["shift_end"], p["rest_days"], 1))
+            created += 1
+        else:
+            ex("UPDATE agents SET active=1 WHERE id=?", (aid,))
+        ex("DELETE FROM schedule_changes WHERE agent_id=? AND effective_from>=? AND note='schedule import'",
+           (aid, str(start)))
+        for eff, ss, se, rd in p["versions"]:
+            set_permanent_schedule(aid, eff, ss, se, rd, "schedule import")
+        ids[p["name"]] = aid
+    for aid in deactivate:
+        ex("UPDATE agents SET active=0 WHERE id=?", (int(aid),))
+    touched = list(ids.values())
+    if touched:
+        marks = ",".join("?" * len(touched))
+        ex(f"DELETE FROM schedule_overrides WHERE agent_id IN ({marks}) AND date BETWEEN ? AND ? "
+           "AND (note IS NULL OR note IN ('', 'schedule import'))", (*touched, str(start), str(end)))
+        ex(f"DELETE FROM leaves WHERE agent_id IN ({marks}) AND reason='schedule import' "
+           "AND start_date<=? AND end_date>=?", (*touched, str(end), str(start)))
+    exmany("INSERT OR REPLACE INTO schedule_overrides VALUES(?,?,?,?,?,?)",
+           [(ids[x["name"]], str(x["date"]), x["kind"], x["start"], x["end"], "schedule import")
+            for x in plan["exceptions"] if x["name"] in ids])
+    today = str(today_site())
+    exmany("INSERT INTO leaves(agent_id,leave_type,start_date,end_date,days,status,reason,filed_on,decided_by) "
+           "VALUES(?,?,?,?,?,?,?,?,?)",
+           [(ids[x["name"]], x["type"], str(x["start"]), str(x["end"]), (x["end"] - x["start"]).days + 1,
+             "Approved", "schedule import", today, "schedule import") for x in plan["leaves"] if x["name"] in ids])
+    sync_current_schedules()
+    return dict(created=created, updated=len(ids) - created, exceptions=len(plan["exceptions"]),
+                leaves=len(plan["leaves"]))
+
+
+def _read_any_table(up):
+    name = up.name.lower()
+    if name.endswith((".xlsx", ".xls")):
+        return pd.read_excel(up, header=None, dtype=str)
+    data = up.getvalue().decode("utf-8-sig", errors="replace")
+    sep = "\t" if data.count("\t") > data.count(",") else ","
+    return pd.read_csv(io.StringIO(data), header=None, dtype=str, sep=sep, keep_default_na=False,
+                       engine="python", on_bad_lines="skip")
+
+
+def page_schedule_import(acct):
+    st.markdown("**Import the team schedule** (dates down the side, one column per person)")
+    st.caption("Export your schedule sheet as CSV/TSV (or upload the Excel file). Cells can be a start time "
+               "(e.g. `2:00 PM`), a range (`12PM-8PM`, `10PM / 8AM`), `RD`, `LEAVE`, `SICK`, `VL`, `EMERGENCY` or "
+               "`TRAINING`. Each person's **permanent schedule** is worked out from the recent weeks (their usual "
+               "shift and days off); anything different on a given date is saved as a one-off change, and leave "
+               "becomes approved time off. Re-uploading replaces what an earlier import set for those dates.")
+    up = st.file_uploader("Schedule file", type=["csv", "tsv", "txt", "xlsx"], key="grid_file")
+    c = st.columns(4)
+    year = c[0].number_input("Year", 2020, 2100, today_site().year, key="grid_year")
+    start = c[1].date_input("Load from", week_start(today_site()), key="grid_start")
+    hours = c[2].number_input("Hours when only a start time is given", 1.0, 16.0, 8.0, step=0.5, key="grid_hours")
+    accts = account_names() or ["ZEVO Messaging"]
+    account = c[3].selectbox("Account for new people", accts,
+                             index=accts.index("ZEVO Messaging") if "ZEVO Messaging" in accts else 0, key="grid_acct")
+    if up is None:
+        return
+    try:
+        grid = read_schedule_grid(_read_any_table(up), int(year))
+    except Exception as e:
+        st.error(f"Couldn't read that file: {e}")
+        return
+    last = max(max(v) for v in grid.values())
+    end = st.date_input("Load until", last, key="grid_end")
+    plan = plan_schedule_import(grid, start, end, hours)
+    ppl = pd.DataFrame(plan["people"])
+    if ppl.empty:
+        st.warning("Nobody with shifts was found in that date range.")
+        return
+    ag = q("SELECT id, emp_id, name FROM agents WHERE active=1")
+    known = {str(n).lower() for n in ag.name} | {str(e).lower() for e in ag.emp_id}
+    ppl["status"] = ["update" if (n.lower() in known or u in known) else "new" for n, u in zip(ppl.name, ppl.username)]
+    ppl["exceptions"] = [sum(1 for x in plan["exceptions"] if x["name"] == n) for n in ppl.name]
+    ppl["time_off"] = [sum(1 for x in plan["leaves"] if x["name"] == n) for n in ppl.name]
+    st.write(f"**{len(ppl)} people** · permanent schedules from {start:%b %d} · "
+             f"{len(plan['exceptions'])} one-off changes · {len(plan['leaves'])} time-off entries "
+             f"· {start:%b %d} → {end:%b %d, %Y}")
+    ppl["rest_days"] = ppl.rest_days.replace("", "none")
+    ppl["later_changes"] = ["; ".join(f"from {v[0]:%b %d}: {v[1]}–{v[2]}, off {v[3] or 'none'}" for v in vs[1:])
+                            for vs in ppl.versions]
+    st.dataframe(ppl[["name", "username", "status", "shift_start", "shift_end", "rest_days", "later_changes",
+                      "last_scheduled", "exceptions", "time_off"]], hide_index=True, width="stretch", column_config={
+        "username": st.column_config.TextColumn("Username / Emp ID", help="Used as their login username"),
+        "rest_days": "Days off", "later_changes": "Permanent changes later",
+        "last_scheduled": st.column_config.DateColumn(
+            "Last date in sheet", help="After this date their permanent schedule continues — deactivate them in "
+                                       "Roster if they've left"),
+        "exceptions": "One-off changes", "time_off": "Time off"})
+    if plan["warnings"]:
+        with st.expander(f"⚠️ {len(plan['warnings'])} cell(s) needed a judgment call"):
+            st.write("\n".join(f"- {w}" for w in plan["warnings"]))
+    names = {n.lower() for n in ppl.name} | set(ppl.username)
+    others = ag[[str(n).lower() not in names and str(e).lower() not in names for n, e in zip(ag.name, ag.emp_id)]]
+    deactivate = []
+    if len(others):
+        lbl = {int(r.id): f"{r.name} ({r.emp_id})" for r in others.itertuples()}
+        deactivate = st.multiselect("These active agents aren't in the schedule — deactivate them?", list(lbl),
+                                    default=list(lbl), format_func=lbl.get, key="grid_deact",
+                                    help="Deactivated agents disappear from schedules and can't sign in; "
+                                         "their history is kept")
+    if st.button("📥 Import schedule", type="primary", key="grid_go"):
+        res = apply_schedule_import(plan, start, end, account,
+                                    q("SELECT lob FROM accounts WHERE name=?", (account,)).lob.iloc[0]
+                                    if account in account_names() else "Non-Voice", deactivate)
+        for aid in deactivate:
+            for u in q("SELECT username FROM users WHERE agent_id=?", (aid,)).username:
+                ex("UPDATE users SET active=0 WHERE username=?", (u,))
+                end_user_sessions(u)
+        st.session_state["grid_done"] = res
+        rerun()
+    if st.session_state.get("grid_done"):
+        r = st.session_state.pop("grid_done")
+        st.success(f"Imported: {r['created']} new people, {r['updated']} updated, {r['exceptions']} one-off changes, "
+                   f"{r['leaves']} time-off entries. Next: **Users → Create agent logins** for anyone new.")
+
+
+def page_permanent_change(acct):
+    st.markdown("**Permanent schedule change**")
+    st.caption("Use this when someone's regular shift or days off change for good. Pick the date it starts — "
+               "earlier dates keep the old schedule, so past attendance stays correct. For a single day, use "
+               "**Change a schedule** instead.")
+    ag = agents_df(True, acct)
+    labels = agent_label_map(ag)
+    if not labels:
+        st.info("No agents.")
+        return
+    with st.form("perm_change"):
+        ids = st.multiselect("Agent(s)", list(labels), format_func=labels.get, key="pc_ids")
+        c = st.columns(3)
+        eff = c[0].date_input("Starting", today_site() + ONE_DAY, key="pc_eff")
+        ss = c[1].text_input("New shift start (HH:MM)", "08:00", key="pc_ss")
+        se = c[2].text_input("New shift end (HH:MM)", "16:00", key="pc_se")
+        rd = st.multiselect("Days off", DAYS, default=["Sat", "Sun"], key="pc_rd")
+        if st.form_submit_button("Save permanent change", type="primary"):
+            if not ids:
+                st.error("Pick at least one agent.")
+            elif not (re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", ss) and re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", se)):
+                st.error("Times must be HH:MM (24-hour), e.g. 22:00.")
+            else:
+                for aid in ids:
+                    set_permanent_schedule(aid, eff, ss, se, ",".join(rd), f"changed by {current_user()['username']}")
+                st.success(f"Saved. From {eff:%a %b %d}: {ss}–{se}, days off {', '.join(rd) or 'none'}.")
+    hist = q("SELECT a.name, c.effective_from, c.shift_start, c.shift_end, c.rest_days, c.note FROM schedule_changes c "
+             "JOIN agents a ON a.id=c.agent_id WHERE c.effective_from>'2000-01-01' ORDER BY c.effective_from DESC, a.name")
+    if acct != "All accounts":
+        hist = hist[hist.name.isin(ag.name)]
+    if len(hist):
+        st.markdown("**Change history**")
+        st.dataframe(hist, hide_index=True, width="stretch")
 
 
 # ----------------------------------------------------------------- logins
@@ -2493,8 +2918,7 @@ def auth_gate():
             role = st.radio("Sign in as", ["🧑‍💼 Agent", "🛡️ Admin"], horizontal=True, key="login_role")
             want = "admin" if "Admin" in role else "agent"
             with st.form("login"):
-                un = st.text_input("Username" if want == "admin" else "Employee ID",
-                                   placeholder="Admin username" if want == "admin" else "e.g. 10013")
+                un = st.text_input("Username", placeholder="Admin username" if want == "admin" else "Your username")
                 pw = st.text_input("Password", type="password")
                 if st.form_submit_button(f"Sign in as {want.title()}", type="primary", width="stretch"):
                     user, err = authenticate(un, pw)
@@ -3228,6 +3652,8 @@ AGENT_PAGES = {
     "🔑 My password": lambda acct: page_change_password(),
 }
 PAGES = ADMIN_PAGES if is_admin() else AGENT_PAGES  # agents never get the admin pages
+if is_admin():
+    sync_current_schedules()  # roster shows the permanent schedule in effect today (cheap; writes only on change)
 
 with st.sidebar:
     st.title("🗓️ WFM Scheduler")
