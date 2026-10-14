@@ -870,6 +870,23 @@ def _fmt_win(s, e):
     return f"{s:%H:%M}-{e:%H:%M}"
 
 
+TIER_LABEL = {1: "1 · Rest day", 2: "2 · Shift extension", 3: "3 · Separate block (gap)"}
+
+
+def _cover_kind(ctx, s, e, adjacent):
+    """(cover type, priority tier, gap hours to their nearest own shift) for a cover block."""
+    if s is None:
+        return ("Rest Day OT" if ctx["today"].kind not in WORK_KINDS else "—"), 9, None
+    if adjacent:
+        return "Pre/Post-shift OT", 2, 0.0
+    near = [min(abs((s - we).total_seconds()), abs((ws - e).total_seconds())) / 3600
+            for ws, we, *_ in ctx["shifts"] if ws.date() == s.date() or we.date() == s.date()
+            or ws.date() == e.date() or we.date() == e.date()]
+    if ctx["today"].kind not in WORK_KINDS:
+        return "Rest Day OT", 1, round(min(near), 1) if near else None
+    return "Same-day OT (separate block)", 3, round(min(near), 1) if near else None
+
+
 def find_coverage(day, need_start, need_end, account, skill="", exclude=()):
     """Rank every active agent for covering a window on `day`, including who can cover part of it."""
     ns, ne = shift_window(day, need_start, need_end)
@@ -900,10 +917,7 @@ def find_coverage(day, need_start, need_end, account, skill="", exclude=()):
         else:
             cs = ce = None
             can = "No"
-        if today.kind in WORK_KINDS:
-            ctype = "Pre/Post-shift OT" if adjacent else "Same-day OT (separate block)"
-        else:
-            ctype = "Rest Day OT"
+        ctype, tier, gap_h = _cover_kind(ctx, cs, ce, adjacent)
         skills = str(info.skills or "").lower()
         score = (3 if info.account == account else 0) + (1 if info.lob == lob else 0)
         score += 2 if skill and skill in skills else 0
@@ -913,52 +927,82 @@ def find_coverage(day, need_start, need_end, account, skill="", exclude=()):
         out.append(dict(agent_id=int(aid), name=info["name"], emp_id=info.emp_id, account=info.account,
                         lob=info.lob, skills=info.skills, today=today.kind if today.kind != "Work"
                         else f"Work {today.shift_start}-{today.shift_end}",
+                        priority=TIER_LABEL[tier] if cs else "", gap_hrs=gap_h,
                         can_cover=can, cover_window=_fmt_win(cs, ce) if cs else "", cover_hrs=hrs,
                         cover_type=ctype, ot_this_week=round(ctx["wk"], 1), score=round(score, 2),
                         eligible=not reasons, why_not="; ".join(reasons),
-                        _s=cs, _e=ce))
+                        _s=cs, _e=ce, _tier=tier if cs else 9))
     df = pd.DataFrame(out)
     if df.empty:
         return df
-    df["_rank"] = df.can_cover.map({"Full": 2, "Partial": 1, "No": 0})
-    return df.sort_values(["_rank", "cover_hrs", "score"], ascending=False).drop(columns="_rank").reset_index(drop=True)
+    df["_rank"] = df.can_cover.map({"Full": 0, "Partial": 1, "No": 2})
+    df["_neg_h"], df["_neg_s"] = -df.cover_hrs, -df.score
+    df["_gap"] = np.where(df._tier == 3, df.gap_hrs.fillna(0), 0)  # smaller gap only matters for separate blocks
+    return df.sort_values(["_tier", "_rank", "_neg_h", "_gap", "_neg_s"]) \
+        .drop(columns=["_rank", "_neg_h", "_neg_s", "_gap"]).reset_index(drop=True)
 
 
-def split_cover_plan(day, need_start, need_end, account, skill="", exclude=()):
-    """Greedy plan: keep adding the agent who covers the most of what's still uncovered."""
+def split_cover_plan(day, need_start, need_end, account, skill="", exclude=(), max_people=6):
+    """Best combination of agents (each takes one block, 30-min steps) for the window.
+    Order of importance: cover as much as possible → rest-day agents first, few hand-offs → small gaps → score."""
     ns, ne = shift_window(day, need_start, need_end)
     min_rest, max_daily, max_wk = setting("min_rest_hrs"), setting("max_daily_hrs"), setting("max_weekly_ot_hrs")
-    min_h = max(0.5, setting("ot_min_block_hrs"))
-    rules = lambda c, s, e: _cover_rules(c, s, e, min_rest, max_daily, max_wk)
+    min_slots = max(1, int(round(max(0.5, setting("ot_min_block_hrs")) * 2)))
+    step = dt.timedelta(minutes=30)
+    n = int((ne - ns) / step)
     ranked = find_coverage(day, need_start, need_end, account, skill, exclude)
-    if ranked.empty:
+    if ranked.empty or n <= 0:
         return [], [(ns, ne)]
     ctxs = coverage_context(day, exclude)
-    pool = [int(a) for a in ranked[ranked.can_cover != "No"].agent_id]
     score = dict(zip(ranked.agent_id.astype(int), ranked.score))
-    segs, plan = [(ns, ne)], []
-    while segs and pool:
-        best = None
-        for aid in pool:
-            r = _best_part(ctxs[aid], ns, ne, rules, min_h, segs)
-            if r and (best is None or (r[1] - r[0], score[aid]) > (best[2] - best[1], score[best[0]])):
-                best = (aid, *r)
-        if not best:
-            break
-        aid, s, e, adj = best
-        plan.append(dict(agent_id=aid, start=s, end=e, adjacent=adj))
-        pool.remove(aid)
-        new = []
-        for a, b in segs:
-            if e <= a or s >= b:
-                new.append((a, b))
-                continue
-            if a < s:
-                new.append((a, s))
-            if e < b:
-                new.append((e, b))
-        segs = [x for x in new if (x[1] - x[0]).total_seconds() >= 1800]
-    plan.sort(key=lambda p: p["start"])
+    blocks = {}  # start slot -> [(end slot, aid, tier, gap, type, adjacent)]
+    for aid in (int(a) for a in ranked[ranked.can_cover != "No"].agent_id):
+        c = ctxs[aid]
+        for i in range(n):
+            for j in range(i + min_slots, n + 1):
+                bs, be = ns + i * step, ns + j * step
+                reasons, adj = _cover_rules(c, bs, be, min_rest, max_daily, max_wk)
+                if reasons:
+                    continue
+                ctype, tier, gap_h = _cover_kind(c, bs, be, adj)
+                blocks.setdefault(i, []).append((j, aid, tier, (gap_h or 0.0) if tier == 3 else 0.0, ctype, adj))
+    for i, lst in blocks.items():  # for each block keep only the 3 best agents — keeps the search fast
+        by_end = {}
+        for b_ in sorted(lst, key=lambda b_: (b_[2], b_[3], -score.get(b_[1], 0))):
+            by_end.setdefault(b_[0], [])
+            if len(by_end[b_[0]]) < 3:
+                by_end[b_[0]].append(b_)
+        blocks[i] = [b_ for v in by_end.values() for b_ in v]
+    memo = {}
+
+    def best(t, used):
+        if t >= n:
+            return (0, 0, 0.0, 0.0), []
+        key = (t, used)
+        if key in memo:
+            return memo[key]
+        c0, p0 = best(t + 1, used)
+        res = ((c0[0] + 1,) + c0[1:], p0)  # leave this half hour open
+        if len(used) < max_people:
+            for j, aid, tier, gap_h, ctype, adj in blocks.get(t, []):
+                if aid in used:
+                    continue
+                c1, p1 = best(j, used | frozenset([aid]))
+                cost = (c1[0], c1[1] + tier * (j - t) + 4, c1[2] + gap_h, c1[3] - score.get(aid, 0))
+                if cost < res[0]:
+                    res = (cost, [dict(agent_id=aid, start=ns + t * step, end=ns + j * step, adjacent=adj,
+                                       type=ctype, tier=tier)] + p1)
+        memo[key] = res
+        return res
+
+    _, plan = best(0, frozenset())
+    segs, cur = [], ns
+    for p_ in plan:
+        if p_["start"] > cur:
+            segs.append((cur, p_["start"]))
+        cur = p_["end"]
+    if cur < ne:
+        segs.append((cur, ne))
     return plan, segs
 
 
@@ -1524,6 +1568,11 @@ def page_coverage(acct):
     excl += tuple(int(r) for r in q("SELECT DISTINCT agent_id FROM ot_requests WHERE covering_for=? AND "
                                     "status!='Denied' AND reason LIKE ?", (pre["for"], f"%[gap {day}]%")).agent_id) \
         if pre["for"] else ()
+    all_ag = agents_df(True)
+    nm = {int(r.id): r.name for r in all_ag.itertuples() if int(r.id) not in excl}
+    declined = st.multiselect("Said no / not available", list(nm), format_func=nm.get, key=f"cov_no_{pre_key}",
+                              help="People you asked who can't do it — they're left out of the list and the plan.")
+    excl += tuple(declined)
     res = find_coverage(day, ns, ne, account, skill, excl)
     if res.empty:
         st.info("No agents to evaluate.")
@@ -1538,44 +1587,50 @@ def page_coverage(acct):
     only = st.toggle("Show only agents who can cover (all or part)", True, key="cov_only")
     view = res[res.can_cover != "No"] if only else res
     st.caption(f"**Can cover** = Full, Partial (the longest part they can legally take, in 30-min steps, at least "
-               f"{max(0.5, setting('ot_min_block_hrs')):g}h) or No. Ranked: full first, then most hours, then same "
-               f"account > skill > same LOB > shift extension, minus OT already done this week. Rules: min rest "
+               f"{max(0.5, setting('ot_min_block_hrs')):g}h) or No. **Priority:** 1 rest-day agents, 2 shift extensions "
+               f"(right before/after their shift), 3 separate block with a gap. Within each: full before partial, "
+               f"most hours, smallest gap, then score. Rules: min rest "
                f"{setting('min_rest_hrs'):g}h · max {setting('max_daily_hrs'):g}h/day · OT cap "
                f"{setting('max_weekly_ot_hrs'):g}h/week.")
-    show_cols = ["name", "can_cover", "cover_window", "cover_hrs", "cover_type", "today", "account", "skills",
-                 "ot_this_week", "score", "why_not"]
+    show_cols = ["name", "priority", "can_cover", "cover_window", "cover_hrs", "gap_hrs", "cover_type", "today",
+                 "account", "skills", "ot_this_week", "score", "why_not"]
     st.dataframe(view[show_cols], hide_index=True, width="stretch", column_config={
-        "can_cover": "Can cover", "cover_window": "Can take", "cover_hrs": st.column_config.NumberColumn(
-            "Hours", format="%.1f"), "why_not": "Why not (whole window)"})
+        "priority": "Priority", "can_cover": "Can cover", "cover_window": "Can take",
+        "cover_hrs": st.column_config.NumberColumn("Hours", format="%.1f"),
+        "gap_hrs": st.column_config.NumberColumn("Gap to own shift (h)", format="%.1f",
+                                                 help="Hours between the cover block and their own shift"),
+        "why_not": "Why not (whole window)"})
     able = res[res.can_cover != "No"]
     if able.empty:
         st.warning("Nobody can take any part of this window. Relax the rules in Settings or check other accounts.")
         return
 
-    if n_full == 0:
-        plan, still = split_cover_plan(day, ns, ne, account, skill, excl)
-        st.subheader("🧩 Suggested split cover")
-        if plan:
-            names = dict(zip(res.agent_id.astype(int), res.name))
-            ptab = pd.DataFrame([{"agent": names.get(p["agent_id"], p["agent_id"]), "from": f"{p['start']:%H:%M}",
-                                  "to": f"{p['end']:%H:%M}",
-                                  "hours": round((p["end"] - p["start"]).total_seconds() / 3600, 2),
-                                  "type": "Pre/Post-shift OT" if p["adjacent"] else
-                                  res.set_index("agent_id").cover_type.get(p["agent_id"])} for p in plan])
-            got = ptab.hours.sum()
-            st.caption(f"Nobody can take the whole {need_h:g}h, but these {len(plan)} agent(s) together cover "
-                       f"**{got:g}h of {need_h:g}h**."
-                       + (" Still open: " + ", ".join(_fmt_win(a, b) for a, b in still) if still else " ✅ Fully covered."))
-            st.dataframe(ptab, hide_index=True, width="stretch")
-            if st.button(f"Assign this split cover ({len(plan)} OT records)", type="primary", key=f"cov_split_{pre_key}"):
-                for p_ in plan:
-                    ctype = ptab.type[plan.index(p_)]
-                    assign_cover(p_["agent_id"], p_["start"], p_["end"], pre["for"], pre["label"], account, day, ctype)
-                st.success(f"Split cover assigned — {got:g}h across {len(plan)} agents.")
-                rerun()
-        else:
-            st.caption("No combination of agents covers any part of this window.")
-        st.markdown("**Or assign one agent**")
+    st.subheader("📋 Full coverage plan")
+    plan, still = split_cover_plan(day, ns, ne, account, skill, excl)
+    if plan:
+        names = dict(zip(res.agent_id.astype(int), res.name))
+        order = sorted(range(len(plan)), key=lambda i: (plan[i]["tier"], plan[i]["start"]))
+        ask = {i: k + 1 for k, i in enumerate(order)}
+        ptab = pd.DataFrame([{"ask": ask[i], "agent": names.get(p["agent_id"], p["agent_id"]),
+                              "from": f"{p['start']:%H:%M}", "to": f"{p['end']:%H:%M}",
+                              "hours": round((p["end"] - p["start"]).total_seconds() / 3600, 2),
+                              "priority": TIER_LABEL.get(p["tier"], ""), "type": p["type"]}
+                             for i, p in enumerate(plan)])
+        got = ptab.hours.sum()
+        st.caption(f"Who to ask, in order: rest-day agents first, then shift extensions, then anyone who'd come back "
+                   f"after a gap. Together they cover **{got:g}h of {need_h:g}h**."
+                   + (" Still open: " + ", ".join(_fmt_win(a, b) for a, b in still) if still else " ✅ Fully covered.")
+                   + " If someone says no, add them to **Said no / not available** and the plan picks the next person.")
+        st.dataframe(ptab, hide_index=True, width="stretch")
+        if st.button(f"Assign this plan ({len(plan)} OT record{'s' if len(plan) > 1 else ''})", type="primary",
+                     key=f"cov_split_{pre_key}"):
+            for p_ in plan:
+                assign_cover(p_["agent_id"], p_["start"], p_["end"], pre["for"], pre["label"], account, day, p_["type"])
+            st.success(f"Coverage assigned — {got:g}h across {len(plan)} agent(s).")
+            rerun()
+    else:
+        st.caption("No combination of agents covers any part of this window.")
+    st.markdown("**Or assign one agent yourself**")
 
     lbl = {int(r.agent_id): f"{r.name} · {r.can_cover} {r.cover_window} ({r.cover_hrs:g}h) · {r.cover_type}"
            for r in able.itertuples()}
