@@ -96,7 +96,7 @@ if USE_SHEETS:
 else:
     DB_PATH = os.environ.get("WFM_DB", "wfm.db")
 TABLES = ["accounts", "agents", "schedule_overrides", "attendance", "leaves", "ot_requests", "settings",
-          "interval_volume", "users", "time_logs", "sessions", "schedule_changes", "payroll_runs", "payroll_lines"]
+          "interval_volume", "users", "time_logs", "sessions", "schedule_changes", "payroll_runs", "payroll_lines", "adjustments"]
 APPEND_TABLES = {"time_logs"}  # insert-only logs are appended to the sheet instead of rewriting the tab
 _WRITE_RE = re.compile(r"^\s*(?:INSERT(?:\s+OR\s+\w+)?\s+INTO|UPDATE|DELETE\s+FROM)\s+(\w+)", re.I)
 DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
@@ -188,6 +188,10 @@ CREATE TABLE IF NOT EXISTS ot_requests(
   start_time TEXT, end_time TEXT, hours REAL, reason TEXT, status TEXT DEFAULT 'Pending',
   covering_for INTEGER, filed_on TEXT, for_account TEXT);
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS adjustments(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, agent_id INTEGER, shift_date TEXT, kind TEXT, reason TEXT, details TEXT,
+  start_time TEXT, end_time TEXT, minutes REAL, makeup TEXT, makeup_start TEXT, makeup_end TEXT,
+  status TEXT DEFAULT 'Pending', filed_at TEXT, decided_by TEXT, decided_at TEXT);
 CREATE TABLE IF NOT EXISTS payroll_runs(
   run_id TEXT PRIMARY KEY, period_start TEXT, period_end TEXT, cutoff TEXT, status TEXT,
   generated_at TEXT, generated_by TEXT, finalized_at TEXT, finalized_by TEXT, note TEXT);
@@ -1919,7 +1923,7 @@ def load_sample_data():
 
 def wipe_all_data():
     for t in ("attendance", "leaves", "ot_requests", "schedule_overrides", "agents", "accounts", "interval_volume",
-              "time_logs", "schedule_changes", "payroll_lines", "payroll_runs"):
+              "time_logs", "schedule_changes", "payroll_lines", "payroll_runs", "adjustments"):
         ex(f"DELETE FROM {t}")
     ex("DELETE FROM users WHERE role='agent'")  # agent logins point at roster rows that are now gone
     ex("DELETE FROM sessions WHERE username NOT IN (SELECT username FROM users)")
@@ -2063,6 +2067,17 @@ def load_zevo_demo():
         rebuild_attendance(aid, d)
     for aid, d, stt in absent:
         save_attendance(aid, d, None, None, stt, 0, 0, 0, "")
+    # a same-day adjustment waiting for approval (shows on Live Floor)
+    tw = build_schedule(today, today)
+    tw = tw[tw.kind == "Work"]
+    if len(tw):
+        r = tw.iloc[0]
+        s_, e_ = shift_window(today, r.shift_start, r.shift_end)
+        ex("INSERT INTO adjustments(agent_id,shift_date,kind,reason,details,start_time,end_time,minutes,makeup,"
+           "makeup_start,makeup_end,status,filed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+           (int(r.agent_id), str(today), "Undertime", "Lost power", "Power outage in our area",
+            f"{e_ - dt.timedelta(hours=2):%H:%M}", f"{e_:%H:%M}", 120, "Yes", f"{e_:%H:%M}",
+            f"{e_ + dt.timedelta(hours=1):%H:%M}", "Pending", now.isoformat(timespec="seconds")))
     # payroll: last two cutoffs (older one already sent to accounting)
     past = [c for c in payroll_cutoffs(today, back=2, ahead=0) if c <= today][-2:]
     for k, c in enumerate(past):
@@ -3499,6 +3514,95 @@ def _dt(s):
         return pd.to_datetime(str(s).strip(), format="mixed").to_pydatetime().replace(tzinfo=None)
 
 
+# ----------------------------------------------------------------- same-day adjustments
+ADJ_REASONS = ["Emergency", "Sickness", "Lost internet", "Lost power", "Others"]
+ADJ_KINDS = ["Undertime", "Extended break"]
+
+
+def shift_adjustments(agent_id, shift_date, s, e, statuses=("Approved",)):
+    """Same-day adjustments for one shift, with their windows as datetimes."""
+    df = q("SELECT * FROM adjustments WHERE agent_id=? AND shift_date=? AND status IN (%s) ORDER BY id"
+           % ",".join("?" * len(statuses)), (agent_id, str(shift_date), *statuses))
+    d = dt.date.fromisoformat(str(shift_date))
+    out = []
+    for r in df.itertuples():
+        a = dict(id=int(r.id), kind=r.kind, reason=r.reason, details=r.details or "", status=r.status,
+                 minutes=float(r.minutes or 0), makeup=r.makeup == "Yes", lost=None, mk=None)
+        if r.kind == "Undertime" and r.start_time and r.end_time and s is not None:
+            ls = closest_dt(d, r.start_time, s + (e - s) / 2)
+            le = closest_dt(d, r.end_time, ls + dt.timedelta(minutes=a["minutes"] or 60))
+            if le <= ls:
+                le += ONE_DAY
+            a["lost"] = (max(ls, s), min(le, e))
+        if a["makeup"] and r.makeup_start and r.makeup_end:
+            a["mk"] = place_ot(d, r.makeup_start, r.makeup_end, (s, e) if s is not None else None)
+        out.append(a)
+    return out
+
+
+def _sessions(events):
+    """Logged-in intervals from a shift's clock events (breaks are paid, so they stay inside)."""
+    out, start = [], None
+    for ev, ts in events:
+        if ev == "login" and start is None:
+            start = ts
+        elif ev == "logout" and start is not None:
+            out.append((start, ts))
+            start = None
+    if start is not None:
+        out.append((start, None))
+    return out
+
+
+def _covered(sessions, a, b, now=None):
+    """Minutes of a..b covered by the sessions."""
+    tot = 0.0
+    for s0, e0 in sessions:
+        e0 = e0 or now or s0
+        tot += max(0.0, (min(e0, b) - max(s0, a)).total_seconds() / 60)
+    return tot
+
+
+def adjustment_error(agent_id, w, kind, lost_from, lost_to, ext_min, makeup, mk_from, mk_to):
+    """Validate a same-day adjustment against the shift window `w`. Returns (minutes, error)."""
+    s, e = w["start"], w["end"]
+    d = dt.date.fromisoformat(w["shift_date"])
+    if kind == "Undertime":
+        for t in (lost_from, lost_to):
+            if not re.fullmatch(TIME_RE, t or ""):
+                return 0, "Times must be HH:MM (24-hour), e.g. 15:30."
+        ls = closest_dt(d, lost_from, s + (e - s) / 2)
+        le = closest_dt(d, lost_to, ls)
+        if le <= ls:
+            le += ONE_DAY
+        if ls < s or le > e:
+            return 0, f"The time you'll be out has to be inside your shift ({s:%H:%M}–{e:%H:%M})."
+        lost = mins(le - ls)
+        if lost < 5:
+            return 0, "That's less than 5 minutes."
+        for a in shift_adjustments(agent_id, w["shift_date"], s, e, ("Pending", "Approved")):
+            if a["lost"] and a["lost"][0] < le and ls < a["lost"][1]:
+                return 0, "You already filed undertime for part of that time."
+    else:
+        lost = int(ext_min or 0)
+        if lost < 5:
+            return 0, "Enter how many extra break minutes you need (at least 5)."
+    if makeup:
+        for t in (mk_from, mk_to):
+            if not re.fullmatch(TIME_RE, t or ""):
+                return 0, "Make-up times must be HH:MM (24-hour)."
+        ms, me = place_ot(d, mk_from, mk_to, (s, e))
+        if ms < e and s < me:
+            return 0, "Make-up time has to be outside your scheduled shift."
+        if ms.date() not in (s.date(), e.date()) or me - ms > dt.timedelta(hours=12):
+            return 0, "Make-up time has to be on the same day as this shift."
+        if mins(me - ms) > lost:
+            return 0, f"Make-up time ({mins(me - ms)} min) is longer than the time you'll miss ({lost} min)."
+        if mins(me - ms) < 5:
+            return 0, "Make-up time is too short."
+    return lost, None
+
+
 def agent_shift_windows(agent_id, d1, d2):
     """Work windows (with login-open time) for one agent's shifts starting d1..d2."""
     sch = build_schedule(d1, d2, agent_id=agent_id)
@@ -3516,7 +3620,12 @@ def agent_shift_windows(agent_id, d1, d2):
                 os_, oe = place_ot(d, o.start_time, o.end_time, (s, e))
                 if oe <= s:  # approved pre-shift OT: allow logging in for it
                     opens = min(opens, os_ - dt.timedelta(minutes=30))
-        out.append(dict(shift_date=r.date, kind=r.kind, start=s, end=e, opens=opens,
+        until = e
+        for a in shift_adjustments(agent_id, r.date, s, e):
+            if a["mk"]:  # approved make-up time: allow logging in for it
+                opens = min(opens, a["mk"][0] - dt.timedelta(minutes=30))
+                until = max(until, a["mk"][1])
+        out.append(dict(shift_date=r.date, kind=r.kind, start=s, end=e, opens=opens, until=until,
                         label=f"{r.shift_start}–{r.shift_end}"))
     return out
 
@@ -3524,7 +3633,7 @@ def agent_shift_windows(agent_id, d1, d2):
 def resolve_shift(agent_id, now):
     """Which shift a log-in at `now` belongs to (handles graveyard shifts and early OT log-ins)."""
     wins = [w for w in agent_shift_windows(agent_id, now.date() - ONE_DAY, now.date() + ONE_DAY)
-            if w["opens"] <= now <= w["end"]]
+            if w["opens"] <= now <= w.get("until", w["end"])]
     if not wins:
         return None
     return min(wins, key=lambda w: abs((w["start"] - now).total_seconds()))
@@ -3544,7 +3653,7 @@ def clock_state(agent_id, now=None):
     # an open session goes stale if the shift ended long ago (forgot to log out)
     wins = [w for w in agent_shift_windows(agent_id, dt.date.fromisoformat(shift_date),
                                            dt.date.fromisoformat(shift_date)) if w["shift_date"] == shift_date]
-    end = wins[0]["end"] if wins else login_ts + dt.timedelta(hours=setting("max_daily_hrs"))
+    end = wins[0].get("until", wins[0]["end"]) if wins else login_ts + dt.timedelta(hours=setting("max_daily_hrs"))
     if now > end + dt.timedelta(hours=4):
         return dict(state="out", shift_date=None, since=None, stale=shift_date)
     state = {"break_start": "break", "lunch_start": "lunch"}.get(last.event, "in")
@@ -3600,8 +3709,24 @@ def rebuild_attendance(agent_id, shift_date):
     else:
         stt, late, ut, ot = "Unscheduled", 0, 0, 0
     b = break_summary(events)
+    over = b["over"]
+    remarks = re.sub(r"(;\s*)?Excused:[^;]*", "", remarks).strip(" ;")
+    if wins:
+        notes = []
+        sess = _sessions(events)
+        for a in shift_adjustments(agent_id, shift_date, wins[0]["start"], wins[0]["end"]):
+            if a["kind"] == "Extended break":
+                over = max(0, over - int(a["minutes"]))
+            if a["mk"]:
+                ot = max(0, ot - int(_covered(sess, *a["mk"])))
+            notes.append(f"{a['kind'].lower()} {int(a['minutes'])}m ({a['reason']})"
+                         + (f", make-up {a['mk'][0]:%H:%M}-{a['mk'][1]:%H:%M}" if a["mk"] else ", no make-up"))
+        if notes:
+            if stt == "Undertime":
+                stt = "Undertime (excused)"
+            remarks = ((remarks + "; ") if remarks else "") + "Excused: " + " | ".join(notes)
     save_attendance(agent_id, shift_date, tin.strftime("%H:%M"), tout.strftime("%H:%M") if tout else None,
-                    stt, late, ut, ot, remarks, break_min=b["total"], overbreak_min=b["over"])
+                    stt, late, ut, ot, remarks, break_min=b["total"], overbreak_min=over)
 
 
 def clock_action(agent_id, action, now=None):
@@ -3694,6 +3819,113 @@ def _fmt_dur(m):
     return f"{m // 60}h {m % 60:02d}m" if m >= 60 else f"{m}m"
 
 
+def _today_shift(aid, now):
+    """The shift a same-day adjustment is for: the one you're logged into, else the one running now / today."""
+    stc = clock_state(aid, now)
+    wins = agent_shift_windows(aid, now.date() - ONE_DAY, now.date())
+    if stc["state"] != "out":
+        w = [x for x in wins if x["shift_date"] == stc["shift_date"]]
+        if w:
+            return w[0]
+    live = [x for x in wins if x["start"] - dt.timedelta(hours=2) <= now <= x["end"]]
+    if live:
+        return live[0]
+    todays = [x for x in wins if x["shift_date"] == str(now.date())]
+    return todays[0] if todays else None
+
+
+def _adjustment_form(aid):
+    now = now_site()
+    w = _today_shift(aid, now)
+    with st.expander("📝 Same-day adjustment — undertime or extended break", expanded=False):
+        if not w:
+            st.caption("You don't have a shift today, so there's nothing to adjust.")
+            return
+        st.caption(f"For your shift **{w['label']}** ({w['shift_date']}). Your admin will approve it. "
+                   "Approved time is excused (not counted as undertime / over-break). Time you don't make up is unpaid; "
+                   "make-up time is paid as regular hours.")
+        c = st.columns(2)
+        kind = c[0].radio("What do you need?", ["Undertime", "Extended break"], key="adj_kind",
+                          captions=["Leaving early or offline for part of the shift", "A longer break than allowed"])
+        reason = c[1].selectbox("Reason", ADJ_REASONS, key="adj_reason")
+        details = c[1].text_input("Details" + (" (required)" if reason == "Others" else
+                                                                             " (optional)"), key="adj_details")
+        lf = lt = None
+        ext = 0
+        if kind == "Undertime":
+            c = st.columns(2)
+            start_default = max(now, w["start"]) if now < w["end"] else w["start"]
+            lf = c[0].text_input("Out from (HH:MM)", f"{start_default:%H:%M}", key="adj_from")
+            lt = c[1].text_input("Out until (HH:MM)", f"{w['end']:%H:%M}", key="adj_to",
+                                 help="Your shift end if you're leaving for the rest of the shift")
+        else:
+            ext = st.number_input("Extra break minutes needed", 5, 240, 15, step=5, key="adj_ext")
+        mk = st.radio("Will you make up the lost time today?", ["Yes", "No"], index=1, horizontal=True, key="adj_mk")
+        mf = mt = None
+        if mk == "Yes":
+            c = st.columns(2)
+            mf = c[0].text_input("Make-up from (HH:MM)", f"{w['end']:%H:%M}", key="adj_mf")
+            mt = c[1].text_input("Make-up until (HH:MM)", f"{w['end'] + dt.timedelta(hours=1):%H:%M}", key="adj_mt",
+                                 help="Same day, outside your scheduled shift")
+        if st.button("Submit adjustment", type="primary", key="adj_submit"):
+            if reason == "Others" and not details.strip():
+                st.error("Please add details for 'Others'.")
+                return
+            lost, err = adjustment_error(aid, w, kind, lf, lt, ext, mk == "Yes", mf, mt)
+            if err:
+                st.error(err)
+                return
+            ex("INSERT INTO adjustments(agent_id,shift_date,kind,reason,details,start_time,end_time,minutes,makeup,"
+               "makeup_start,makeup_end,status,filed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+               (aid, w["shift_date"], kind, reason, details.strip(), lf, lt, lost, mk, mf, mt, "Pending",
+                now.isoformat(timespec="seconds")))
+            st.success(f"Sent for approval — {kind.lower()} {lost} min"
+                       + (f", make-up {mf}–{mt}." if mk == "Yes" else ", no make-up."))
+    mine = q("SELECT kind, reason, start_time AS out_from, end_time AS out_until, minutes, makeup, makeup_start, "
+             "makeup_end, status FROM adjustments WHERE agent_id=? AND shift_date>=? ORDER BY id DESC",
+             (aid, str(now.date() - ONE_DAY)))
+    if len(mine):
+        st.caption("Your adjustments (today / yesterday)")
+        st.dataframe(mine, hide_index=True, width="stretch")
+
+
+def decide_adjustment(adj_id, status):
+    r = q("SELECT agent_id, shift_date FROM adjustments WHERE id=?", (adj_id,))
+    ex("UPDATE adjustments SET status=?, decided_by=?, decided_at=? WHERE id=?",
+       (status, current_user()["username"], now_site().isoformat(timespec="seconds"), adj_id))
+    if len(r):
+        rebuild_attendance(int(r.agent_id.iloc[0]), r.shift_date.iloc[0])
+
+
+def _adjustment_approvals(acct):
+    pend = q("SELECT j.*, a.name, a.account FROM adjustments j JOIN agents a ON a.id=j.agent_id "
+             "WHERE j.status='Pending' ORDER BY j.filed_at")
+    if acct != "All accounts":
+        pend = pend[pend.account == acct]
+    with st.expander(f"📝 Same-day adjustments waiting for approval ({len(pend)})", expanded=len(pend) > 0):
+        if pend.empty:
+            st.caption("Nothing waiting.")
+        for r in pend.itertuples():
+            what = (f"out {r.start_time}–{r.end_time}" if r.kind == "Undertime" else f"+{int(r.minutes)} min break")
+            mk = f"make-up {r.makeup_start}–{r.makeup_end}" if r.makeup == "Yes" else "no make-up"
+            c = st.columns([6, 1, 1])
+            c[0].markdown(f"**{r.name}** · {r.kind} {what} ({int(r.minutes)} min) · {r.reason}"
+                          + (f" — {r.details}" if r.details else "") + f" · {mk} · shift {r.shift_date}")
+            if c[1].button("✅ Approve", key=f"adj_ok_{r.id}"):
+                decide_adjustment(int(r.id), "Approved")
+                rerun()
+            if c[2].button("❌ Deny", key=f"adj_no_{r.id}"):
+                decide_adjustment(int(r.id), "Denied")
+                rerun()
+        recent = q("SELECT a.name, j.shift_date, j.kind, j.reason, j.start_time AS out_from, j.end_time AS out_until, "
+                   "j.minutes, j.makeup, j.makeup_start, j.makeup_end, j.status, j.decided_by FROM adjustments j "
+                   "JOIN agents a ON a.id=j.agent_id WHERE j.status!='Pending' AND j.shift_date>=? "
+                   "ORDER BY j.id DESC", (str(today_site() - 7 * ONE_DAY),))
+        if len(recent):
+            st.caption("Decided in the last 7 days")
+            st.dataframe(recent, hide_index=True, width="stretch")
+
+
 def page_my_shift():
     u = current_user()
     aid = u.get("agent_id")
@@ -3703,6 +3935,7 @@ def page_my_shift():
         return
     st.header(f"🕒 Hi, {str(ag['name']).split()[0]}!")
     _clock_panel(int(aid))
+    _adjustment_form(int(aid))
 
     st.subheader("My schedule — next 7 days")
     today = today_site()
@@ -3851,16 +4084,28 @@ def page_my_requests():
             st.dataframe(ot.drop(columns="id"), hide_index=True, width="stretch")
         else:
             st.caption("None yet.")
+        aj = q("SELECT id, shift_date, kind, reason, start_time AS out_from, end_time AS out_until, minutes, makeup, "
+               "makeup_start, makeup_end, status FROM adjustments WHERE agent_id=? ORDER BY id DESC LIMIT 50", (aid,))
+        st.markdown("**Same-day adjustments** (file them from **My Shift**)")
+        if len(aj):
+            st.dataframe(aj.drop(columns="id"), hide_index=True, width="stretch")
+        else:
+            st.caption("None yet.")
         pend = {f"lv{r.id}": f"Time off · {r.type} · {r.start_date}→{r.end_date}"
                 for r in lv[lv.status == "Pending"].itertuples()}
         pend.update({f"ot{r.id}": f"OT · {r.date} {r.start_time}-{r.end_time}"
                      for r in ot[ot.status == "Pending"].itertuples()})
+        pend.update({f"aj{r.id}": f"Adjustment · {r.shift_date} {r.kind} {int(r.minutes)} min"
+                     for r in aj[aj.status == "Pending"].itertuples()})
         if pend:
             pick = st.selectbox("Cancel a pending request", list(pend), format_func=pend.get, key="my_cancel")
             if st.button("Cancel request"):
                 kind, rid = pick[:2], int(pick[2:])
                 if kind == "lv":
                     ex("UPDATE leaves SET status='Cancelled' WHERE id=? AND agent_id=? AND status='Pending'", (rid, aid))
+                elif kind == "aj":
+                    ex("UPDATE adjustments SET status='Cancelled' WHERE id=? AND agent_id=? AND status='Pending'",
+                       (rid, aid))
                 else:
                     ex("UPDATE ot_requests SET status='Cancelled' WHERE id=? AND agent_id=? AND status='Pending'",
                        (rid, aid))
@@ -3912,7 +4157,13 @@ def floor_status(now=None):
             elif last in ("break_start", "lunch_start"):
                 kind, m = b["ongoing"]
                 lim = b["allowed"][kind][0]
-                status = f"On {kind} {m} min" + (f" — OVER by {m - lim:g}" if m > lim else "")
+                adjs = shift_adjustments(int(r.agent_id), r.date, s, e, ("Approved", "Pending"))
+                ext_ok = sum(a["minutes"] for a in adjs if a["kind"] == "Extended break" and a["status"] == "Approved")
+                ext_p = sum(a["minutes"] for a in adjs if a["kind"] == "Extended break" and a["status"] == "Pending")
+                lim += ext_ok
+                status = f"On {kind} {m} min" + (f" (extended +{ext_ok:g})" if ext_ok else "") \
+                    + (f" — OVER by {m - lim:g}" if m > lim else "") \
+                    + (f" · extension of {ext_p:g} min waiting for approval" if ext_p else "")
                 flag = "over" if m > lim else "break"
             elif now > e + dt.timedelta(hours=1):
                 status, flag = "Still logged in after shift — missing log out?", "late"
@@ -3939,6 +4190,7 @@ def floor_status(now=None):
 
 def page_live_floor(acct):
     st.header("🟢 Live Floor")
+    _adjustment_approvals(acct)
     n = mark_no_shows()
     if n:
         st.toast(f"Marked {n} no-show(s) as Absent")
@@ -4185,6 +4437,11 @@ def payroll_compute(d1, d2, cutoff, agent_ids=None):
     ots = q("SELECT agent_id, date, ot_type, start_time, end_time, hours FROM ot_requests "
             "WHERE status='Approved' AND date BETWEEN ? AND ?", (str(d1), str(d2)))
     block = max(1.0, setting("ot_block_min"))
+    adj_days = set(map(tuple, q("SELECT agent_id, shift_date FROM adjustments WHERE status='Approved' AND "
+                                "shift_date BETWEEN ? AND ?", (str(d1), str(d2))).astype(str).values.tolist()))
+    tl = q("SELECT agent_id, shift_date, event, ts FROM time_logs WHERE shift_date BETWEEN ? AND ? ORDER BY ts, id",
+           (str(d1), str(d2)))
+    tl_map = {k: [(ev, _dt(t)) for ev, t in zip(g.event, g.ts)] for k, g in tl.groupby(["agent_id", "shift_date"])}
     rows = []
     for r in sch.itertuples():
         aid, ds = int(r.agent_id), str(r.date)
@@ -4230,6 +4487,33 @@ def payroll_compute(d1, d2, cutoff, agent_ids=None):
                     flags.append("No log out")
                 if not tin and status not in ("", None):
                     flags.append("No clock times")
+                events = tl_map.get((aid, ds), [])
+                sess = _sessions(events)
+                if (str(aid), ds) in adj_days:
+                    # approved same-day adjustment: pay the time actually logged in during the shift,
+                    # minus approved extra break, plus make-up time actually worked (capped at what was lost)
+                    adjs = shift_adjustments(aid, ds, s, e)
+                    ext = sum(a["minutes"] for a in adjs if a["kind"] == "Extended break")
+                    lost_ut = sum(a["minutes"] for a in adjs if a["kind"] == "Undertime")
+                    if sess:
+                        raw_over = break_summary(events)["over"]
+                        ext_lost = min(ext, raw_over)
+                        in_shift = _covered(sess, s, e)
+                        made = sum(_covered(sess, *a["mk"]) for a in adjs if a["mk"])
+                        made = min(made, lost_ut + ext_lost)
+                        worked = max(0.0, (in_shift - ext_lost + made) / 60)
+                    else:
+                        made = 0
+                        worked = max(0.0, worked - ext / 60)
+                        if any(a["mk"] for a in adjs):
+                            flags.append("Make-up not verified (no clock times)")
+                    flags.append("Same-day adjustment: " + "; ".join(
+                        f"{a['kind'].lower()} {int(a['minutes'])}m ({a['reason']})"
+                        + (f", made up {made / 60:g}h" if a["mk"] else ", no make-up") for a in adjs))
+                elif len(sess) > 1:
+                    gap = sched_h * 60 - late - ut - _covered(sess, s, e)
+                    if gap > setting("grace_min"):
+                        flags.append(f"Logged out {int(gap)} min during the shift (paid — no adjustment filed)")
             if is_rd_ot:
                 ot += worked
             else:
@@ -4259,7 +4543,8 @@ def payroll_compute(d1, d2, cutoff, agent_ids=None):
                 flags.append(f"OT {o.start_time}-{o.end_time} counted without clock times")
             else:
                 flags.append(f"Approved OT {o.start_time}-{o.end_time} not worked")
-        if a is not None and actual and float(a.ot_min or 0) > 0 and ot == 0 and not is_rd_ot:
+        if a is not None and actual and float(a.ot_min or 0) > 0 and ot == 0 and not is_rd_ot \
+                and (str(aid), ds) not in adj_days:
             flags.append(f"{int(a.ot_min)} min extra time without approved OT (not paid)")
         if not s and reg == 0 and ot == 0 and not flags and r.kind != "Leave":
             continue  # rest day with nothing to pay — keep the report short
