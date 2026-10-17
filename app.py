@@ -4206,32 +4206,176 @@ def payroll_tables(run_id):
     return lines, summ.sort_values("name").reset_index(drop=True)
 
 
+def payroll_timesheet(run, lines):
+    """Their timesheet layout: one row per agent, one column per day.
+    submitted = what went to accounting (paid hours, reg + OT); rendered = what actually happened so far
+    (from the time clock, leave codes on leave days); notes = days that changed after submission."""
+    p1, p2 = dt.date.fromisoformat(run.period_start), dt.date.fromisoformat(run.period_end)
+    days = [p1 + dt.timedelta(days=i) for i in range((p2 - p1).days + 1)]
+    dcols = [str(d) for d in days]
+    base = lines[lines.basis != "Adjustment"]
+    adj = lines[lines.basis == "Adjustment"]
+    agents = lines[["agent_id", "name", "emp_id", "account"]].drop_duplicates("agent_id").sort_values("name")
+    today = today_site()
+    upto = min(p2, today - ONE_DAY)
+    cur = payroll_compute(p1, upto, today) if upto >= p1 else pd.DataFrame(columns=["agent_id", "date"])
+    cur_map = {(int(r.agent_id), str(r.date)): r for r in cur.itertuples()}
+    sub_rows, ren_rows, ot_rows = [], [], []
+    for a in agents.itertuples():
+        aid = int(a.agent_id)
+        mine = base[base.agent_id == aid]
+        by_day = {str(r.date): r for r in mine.itertuples()}
+        a_adj = adj[adj.agent_id == aid]
+        adj_total = round(float((a_adj.reg_final + a_adj.ot_final).sum()), 2)
+        adj_from = "| ".join(f"{dt.date.fromisoformat(r.date):%-m/%-d} ({r.reg_final + r.ot_final:+g})"
+                             for r in a_adj.itertuples())
+        sub = {"Name": a.name, "Adjustment": adj_total or None}
+        ren = {"Name": a.name}
+        otr = {"Name": a.name}
+        notes = []
+        reg_sum = ot_sum = 0.0
+        for d, ds in zip(days, dcols):
+            r = by_day.get(ds)
+            reg_f = float(r.reg_final) if r is not None else 0.0
+            ot_f = float(r.ot_final) if r is not None else 0.0
+            reg_sum, ot_sum = reg_sum + reg_f, ot_sum + ot_f
+            sub[ds] = round(reg_f + ot_f, 2)
+            otr[ds] = round(ot_f, 2) or None
+            if d > upto:
+                ren[ds] = None
+                continue
+            c = cur_map.get((aid, ds))
+            sched = str(c.schedule if c is not None else (r.schedule if r is not None else ""))
+            if sched.startswith("Leave"):
+                ren[ds] = leave_abbrev(sched)
+            else:
+                ren[ds] = round((c.reg_calc + c.ot_calc) if c is not None else 0.0, 2)
+            was = (float(r.reg_calc) + float(r.ot_calc)) if r is not None else 0.0
+            now_v = (c.reg_calc + c.ot_calc) if c is not None else 0.0
+            diff = round(now_v - was, 2)
+            if abs(diff) >= 0.01:
+                notes.append(f"{d:%-m/%-d} plotted {sub[ds]:g} rendered {sub[ds] + diff:g} ({diff:+g})")
+        sub["Reg"] = round(reg_sum, 2)
+        sub["OT"] = round(ot_sum, 2)
+        sub["TOTAL"] = round(reg_sum + ot_sum + adj_total, 2)
+        sub["Notes"] = "| ".join(notes)
+        sub["Adjustment from"] = adj_from
+        ren["Total"] = round(sum(v for k, v in ren.items() if k in dcols and isinstance(v, (int, float))), 2)
+        otr["OT total"] = round(ot_sum, 2)
+        sub_rows.append(sub), ren_rows.append(ren), ot_rows.append(otr)
+    return days, pd.DataFrame(sub_rows), pd.DataFrame(ren_rows), pd.DataFrame(ot_rows)
+
+
 def payroll_excel(run, lines, summ):
+    """Excel in the team's timesheet layout + OT tab + summary + daily detail."""
     import io
-    buf = io.BytesIO()
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter as L
     sv = lambda v: "" if v is None or (isinstance(v, float) and math.isnan(v)) else str(v)
-    head = pd.DataFrame({"": ["Pay period", "Cutoff", "Status", "Generated", "Finalized"],
-                         " ": [f"{run.period_start} to {run.period_end}", f"{run.cutoff} CT", run.status,
-                               f"{run.generated_at} ({run.generated_by})",
-                               (f"{sv(run.finalized_at)} by {sv(run.finalized_by)}" if sv(run.finalized_by) else "")]})
+    days, sub, ren, otd = payroll_timesheet(run, lines)
+    dcols = [str(d) for d in days]
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Timesheet"
+    bold, hdr = Font(bold=True), PatternFill("solid", fgColor="D9E1F2")
+    thin = Side(style="thin", color="BFBFBF")
+    box = Border(left=thin, right=thin, top=thin, bottom=thin)
+    title = f"{days[0]:%B %Y} CST · Pay period {days[0]:%b %-d}–{days[-1]:%b %-d}"
+    n = len(days)
+    # left block: Name, Adjustment, days..., Reg, OT, TOTAL, Notes, Adjustment from
+    left = ["Name", "Adjustment"] + dcols + ["Reg", "OT", "TOTAL", "Notes", "Adjustment from"]
+    gap = len(left) + 2
+    right = ["Name"] + dcols + ["Total"]
+    ws.cell(1, 1, title).font = Font(bold=True, size=13)
+    ws.cell(1, gap, "Rendered hours (from the time clock)").font = Font(bold=True, size=13)
+    for off, cols in ((1, left), (gap, right)):
+        for j, c in enumerate(cols):
+            col = off + j
+            if c in dcols:
+                d = dt.date.fromisoformat(c)
+                ws.cell(2, col, d.strftime("%a").upper())
+                ws.cell(3, col, d.day)
+            else:
+                ws.cell(2, col, "Employee's Name" if c == "Name" else "")
+                ws.cell(3, col, c)
+            for rr in (2, 3):
+                ws.cell(rr, col).font, ws.cell(rr, col).fill = bold, hdr
+                ws.cell(rr, col).alignment = Alignment(horizontal="center")
+                ws.cell(rr, col).border = box
+    r0 = 4
+    for i, row in enumerate(sub.to_dict("records")):
+        for j, c in enumerate(left):
+            v = row.get(c)
+            cell = ws.cell(r0 + i, 1 + j, None if v is None or (isinstance(v, float) and math.isnan(v)) else v)
+            cell.border = box
+            if c == "TOTAL":
+                cell.font = bold
+    for i, row in enumerate(ren.to_dict("records")):
+        for j, c in enumerate(right):
+            v = row.get(c)
+            ws.cell(r0 + i, gap + j, None if v is None or (isinstance(v, float) and math.isnan(v)) else v).border = box
+    tr = r0 + len(sub)
+    ws.cell(tr, 1, "Total Hours / per week").font = bold
+    for j, c in enumerate(left[1:], start=2):
+        if c in ("Notes", "Adjustment from"):
+            continue
+        ws.cell(tr, j, round(float(pd.to_numeric(sub[c], errors="coerce").sum()), 2)).font = bold
+    ws.cell(tr, gap, "Total Hours / per week").font = bold
+    for j, c in enumerate(right[1:], start=gap + 1):
+        ws.cell(tr, j, round(float(pd.to_numeric(ren[c], errors="coerce").sum()), 2)).font = bold
+    status = (f"TIMESHEET SUBMITTED {dt.datetime.fromisoformat(sv(run.finalized_at)):%-I:%M %p} CST "
+              f"{dt.datetime.fromisoformat(sv(run.finalized_at)):%-m/%-d}" if run.status == "Final" and sv(run.finalized_at)
+              else f"DRAFT — not yet submitted (locked {run.cutoff} CT)")
+    ws.cell(tr + 3, 1, status).font = Font(bold=True, color="C00000" if run.status != "Final" else "000000")
+    lr = tr + 5
+    ws.cell(lr, 1, "Name").font = bold
+    ws.cell(lr, 3, "Total Hrs").font = bold
+    for i, row in enumerate(sub.to_dict("records"), start=1):
+        ws.cell(lr + i, 1, row["Name"])
+        ws.cell(lr + i, 3, row["TOTAL"])
+    ws.column_dimensions["A"].width = 18
+    for j in range(2, gap + len(right) + 1):
+        ws.column_dimensions[L(j)].width = 7
+    ws.column_dimensions[L(left.index("Notes") + 1)].width = 50
+    ws.column_dimensions[L(left.index("Adjustment from") + 1)].width = 30
+    ws.column_dimensions[L(gap)].width = 18
+    ws.freeze_panes = "C4"
+
+    def put(sheet_name, df, start=0, header_rows=None):
+        w = wb.create_sheet(sheet_name)
+        for k, (a, b) in enumerate(header_rows or [], start=1):
+            w.cell(k, 1, a).font = bold
+            w.cell(k, 2, b)
+        start = len(header_rows or []) + (1 if header_rows else 0)
+        for j, c in enumerate(df.columns, start=1):
+            cell = w.cell(start + 1, j, c)
+            cell.font, cell.fill = bold, hdr
+            w.column_dimensions[L(j)].width = min(max(10, len(str(c)) + 2), 45)
+        for i, row in enumerate(df.itertuples(index=False), start=start + 2):
+            for j, v in enumerate(row, start=1):
+                w.cell(i, j, None if v is None or (isinstance(v, float) and math.isnan(v)) else v)
+        return w
+
+    ot_view = otd.rename(columns={c: f"{dt.date.fromisoformat(c):%a %-m/%-d}" for c in dcols})
+    put("OT", ot_view)
     s_cols = {"emp_id": "Username/Emp ID", "name": "Name", "account": "Account", "actual_reg": "Actual reg hrs",
               "actual_ot": "Actual OT hrs", "projected_reg": "Projected reg hrs", "projected_ot": "Projected OT hrs",
               "adj_reg": "Prior-period adj reg hrs", "adj_ot": "Prior-period adj OT hrs", "total_reg": "TOTAL reg hrs",
-              "total_ot": "TOTAL OT hrs", "total_hrs": "TOTAL hrs", "logged_hrs_actual_days": "Logged hrs (actual days)",
-              "review_flags": "Items to review"}
+              "total_ot": "TOTAL OT hrs", "total_hrs": "TOTAL hrs (combined)",
+              "logged_hrs_actual_days": "Logged hrs (actual days)", "review_flags": "Items to review"}
+    put("Summary", summ[list(s_cols)].rename(columns=s_cols), header_rows=[
+        ("Pay period", f"{run.period_start} to {run.period_end}"), ("Cutoff", f"{run.cutoff} CT"),
+        ("Status", run.status), ("Generated", f"{sv(run.generated_at)} ({sv(run.generated_by)})"),
+        ("Finalized", f"{sv(run.finalized_at)} by {sv(run.finalized_by)}" if sv(run.finalized_by) else "")])
     d_cols = {"name": "Name", "emp_id": "Username/Emp ID", "date": "Date", "day": "Day", "basis": "Basis",
               "schedule": "Schedule", "time_in": "In", "time_out": "Out", "status": "Status", "late_min": "Late (min)",
               "undertime_min": "Undertime (min)", "logged_hrs": "Logged hrs", "reg_calc": "Reg hrs (calc)",
               "ot_calc": "OT hrs (calc)", "reg_final": "Reg hrs (paid)", "ot_final": "OT hrs (paid)",
               "flags": "Review", "note": "Note"}
-    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
-        head.to_excel(xw, sheet_name="Summary", index=False, header=False)
-        summ[list(s_cols)].rename(columns=s_cols).to_excel(xw, sheet_name="Summary", index=False, startrow=7)
-        lines[list(d_cols)].rename(columns=d_cols).to_excel(xw, sheet_name="Daily detail", index=False)
-        for ws in xw.book.worksheets:
-            for col in ws.columns:
-                width = max(len(str(c.value or "")) for c in col[:200])
-                ws.column_dimensions[col[0].column_letter].width = min(max(10, width + 2), 45)
+    put("Daily detail", lines[list(d_cols)].rename(columns=d_cols))
+    buf = io.BytesIO()
+    wb.save(buf)
     return buf.getvalue()
 
 
@@ -4282,7 +4426,18 @@ def page_payroll(acct):
     if summ.empty:
         st.info("Nothing to pay in this period.")
         return
-    t1, t2, t3 = st.tabs(["Summary", "Daily detail & rounding", "Items to review"])
+    t0, t1, t2, t3 = st.tabs(["Timesheet", "Summary", "Daily detail & rounding", "Items to review"])
+    with t0:
+        days_, sub_, ren_, _ot = payroll_timesheet(run, lines)
+        nice = {str(d): f"{d:%a} {d.day}" for d in days_}
+        st.caption("**Submitted** (what goes to accounting): paid hours per day, regular + OT combined. "
+                   "**Adjustment** carries changes from earlier payrolls. **Notes** list days that changed after this "
+                   "report was locked — they become next payroll's adjustment.")
+        st.dataframe(sub_.rename(columns=nice), hide_index=True, width="stretch")
+        st.markdown("**Rendered so far** (from the time clock; leave shows its code)")
+        st.dataframe(ren_.rename(columns=nice).map(lambda v: "" if v is None or (isinstance(v, float) and math.isnan(v))
+                                                   else f"{v:g}" if isinstance(v, (int, float)) else str(v)),
+                     hide_index=True, width="stretch")
     with t1:
         st.dataframe(summ.drop(columns="agent_id"), hide_index=True, width="stretch", column_config={
             "emp_id": "Username/Emp ID", "actual_reg": "Actual reg", "actual_ot": "Actual OT",
