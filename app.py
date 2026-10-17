@@ -1917,6 +1917,162 @@ def load_sample_data():
                                              ot / 60, "Queue backlog", "Approved", r.date))
 
 
+def wipe_all_data():
+    for t in ("attendance", "leaves", "ot_requests", "schedule_overrides", "agents", "accounts", "interval_volume",
+              "time_logs", "schedule_changes", "payroll_lines", "payroll_runs"):
+        ex(f"DELETE FROM {t}")
+    ex("DELETE FROM users WHERE role='agent'")  # agent logins point at roster rows that are now gone
+    ex("DELETE FROM sessions WHERE username NOT IN (SELECT username FROM users)")
+
+
+DEMO_PASSWORD = "zevo-demo"
+# name, shift start, shift end, rest days, skills  (made-up schedules)
+ZEVO_DEMO_TEAM = [
+    ("Stella", "00:00", "10:00", "Sat", "Chat,SMS"), ("Aga", "21:00", "06:00", "Sun", "Chat,Email"),
+    ("Mark", "22:00", "08:00", "Sat", "Chat,Claims"), ("Erwin", "04:00", "11:00", "Sun,Wed", "Chat,SMS"),
+    ("Beth", "08:00", "20:00", "Sun", "Chat,Escalations"), ("Rence", "06:00", "16:00", "Thu", "Chat,SMS"),
+    ("Noreen", "12:00", "22:00", "Mon", "Chat,Claims"), ("John", "07:00", "16:00", "Tue", "Chat,Email"),
+    ("Jojo", "14:00", "00:00", "Wed", "Chat,Escalations"), ("Nins", "18:00", "00:00", "Sun,Wed", "Chat,SMS"),
+    ("Cham", "09:00", "17:00", "Sun", "Chat,Email"), ("Henna", "10:00", "18:00", "Sat", "Chat,SMS"),
+    ("Tonette", "16:00", "20:00", "Fri", "Chat"), ("Channie", "20:00", "00:00", "Sat", "Chat"),
+    ("Michell", "05:00", "13:00", "Mon", "Chat,SMS"), ("Ella", "13:00", "21:00", "Tue", "Chat,Email"),
+    ("July", "15:00", "23:00", "Thu", "Chat,SMS"), ("Jose", "23:00", "07:00", "Thu", "Chat,Claims"),
+    ("Kriz Petter", "01:00", "09:00", "Mon", "Chat,SMS"), ("Yari", "08:00", "16:00", "Fri", "Chat,Email"),
+    ("Mitch", "11:00", "19:00", "Sun", "Chat,SMS"), ("Jewel", "17:00", "01:00", "Mon", "Chat,Escalations"),
+    ("Faith", "19:00", "03:00", "Sun", "Chat,SMS"), ("Weng", "07:00", "19:00", "Sat", "Chat,Escalations"),
+    ("Kristine", "02:00", "14:00", "Sat", "Chat,Claims")]
+
+
+def load_zevo_demo():
+    """Replace everything with made-up ZEVO-style demo data: the team's first names with invented schedules,
+    ~a month of clock logs, leaves, OT, chat volume and two payroll runs."""
+    rnd = random.Random(2026)
+    wipe_all_data()
+    today, now = today_site(), now_site()
+    upsert_account(dict(name="ZEVO Messaging", lob="Non-Voice", channel="Chat", required_hc=0, max_leave_pct=15,
+                        sl_target_pct=80, sl_seconds=60, concurrency=2, shrinkage_pct=30, max_occupancy_pct=85))
+    for name, ss, se, rd, sk in ZEVO_DEMO_TEAM:
+        ex("INSERT INTO agents(emp_id,name,account,lob,team_lead,skills,shift_start,shift_end,rest_days) "
+           "VALUES(?,?,?,?,?,?,?,?,?)", (re.sub(r"[^a-z0-9]+", ".", name.lower()).strip("."), name,
+                                         "ZEVO Messaging", "Non-Voice", "Weng", sk, ss, se, rd))
+    ag = agents_df(True)
+    ids = dict(zip(ag.name, ag.id.astype(int)))
+    # logins for every agent (demo only — wipe before going live)
+    h = hash_pw(DEMO_PASSWORD)
+    exmany("INSERT OR REPLACE INTO users(username,pw_hash,role,agent_id,active,must_change,created_on) "
+           "VALUES(?,?,?,?,1,0,?)", [(r.emp_id, h, "agent", int(r.id), "2026-09-01T00:00:00") for r in ag.itertuples()])
+    # chat volume: 10 weeks, shaped like a car-sharing chat queue (quiet overnight, busy afternoon)
+    hourly = [3.2, 2.7, 2.1, 1.6, 1.6, 1.8, 2.5, 3.5, 4.9, 6.3, 6.2, 7.0, 7.4, 7.9, 8.0, 8.9, 8.4, 8.0, 7.3, 7.5,
+              6.5, 6.1, 5.2, 4.4]
+    wk = [1.0, 1.0, 1.12, 1.1, 1.04, 0.94, 0.82]
+    vol = []
+    for i in range(70, 0, -1):
+        d = today - dt.timedelta(days=i)
+        growth = 1 + 0.002 * (70 - i)
+        for iv in INTERVALS:
+            lam = hourly[int(iv[:2])] / 2 * wk[d.weekday()] * growth
+            n = sum(1 for _ in range(40) if rnd.random() < lam / 40)
+            vol.append(("ZEVO Messaging", str(d), iv, float(n), float(round(rnd.gauss(420, 40)))))
+    exmany("INSERT OR REPLACE INTO interval_volume VALUES(?,?,?,?,?)", vol)
+    # schedule changes: one permanent change, one one-off swap
+    set_permanent_schedule(ids["Mark"], today + dt.timedelta(days=16), "20:00", "06:00", "Sun", "Moving to earlier graveyard")
+    ex("INSERT OR REPLACE INTO schedule_overrides VALUES(?,?,?,?,?,?)",
+       (ids["Cham"], str(today + dt.timedelta(days=3)), "Work", "12:00", "20:00", "Swap with Mitch"))
+    # leaves (no leave credits — independent contractors)
+    start = dt.date(today.year, today.month, 1) - dt.timedelta(days=15)  # ~mid last month
+    leaves = [("Mark", "Vacation (VL)", start + dt.timedelta(days=12), start + dt.timedelta(days=13), "Approved"),
+              ("Ella", "Sick (SL)", start + dt.timedelta(days=20), start + dt.timedelta(days=20), "Approved"),
+              ("Yari", "Emergency (EL)", today + dt.timedelta(days=2), today + dt.timedelta(days=2), "Approved"),
+              ("Jose", "Vacation (VL)", today + dt.timedelta(days=4), today + dt.timedelta(days=5), "Approved"),
+              ("Faith", "Sick (SL)", today + dt.timedelta(days=6), today + dt.timedelta(days=6), "Pending"),
+              ("Henna", "Vacation (VL)", today + dt.timedelta(days=9), today + dt.timedelta(days=10), "Pending")]
+    for n_, lt, d1, d2, stt in leaves:
+        r = ag[ag.id == ids[n_]].iloc[0]
+        ex("INSERT INTO leaves(agent_id,leave_type,start_date,end_date,days,status,reason,filed_on) "
+           "VALUES(?,?,?,?,?,?,?,?)", (ids[n_], lt, str(d1), str(d2), working_days(r.rest_days, d1, d2), stt,
+                                       "Demo", str(min(d1, today) - dt.timedelta(days=3))))
+    # approved / pending OT
+    ot_rows = []
+    sch = build_schedule(start, today + dt.timedelta(days=14))
+    work = sch[sch.kind == "Work"]
+    for r in work.sample(frac=0.06, random_state=4).itertuples():
+        d = dt.date.fromisoformat(r.date)
+        s, e = shift_window(d, r.shift_start, r.shift_end)
+        hrs = rnd.choice([1, 1, 2])
+        if rnd.random() < 0.7:
+            ot_rows.append((int(r.agent_id), r.date, "Post-shift OT", f"{e:%H:%M}",
+                            f"{e + dt.timedelta(hours=hrs):%H:%M}", hrs, "Queue backlog",
+                            "Approved" if d < today or rnd.random() < 0.6 else "Pending", r.date))
+        else:
+            ot_rows.append((int(r.agent_id), r.date, "Pre-shift OT", f"{s - dt.timedelta(hours=hrs):%H:%M}",
+                            f"{s:%H:%M}", hrs, "Peak coverage",
+                            "Approved" if d < today or rnd.random() < 0.6 else "Pending", r.date))
+    exmany("INSERT INTO ot_requests(agent_id,date,ot_type,start_time,end_time,hours,reason,status,filed_on) "
+           "VALUES(?,?,?,?,?,?,?,?,?)", ot_rows)
+    # Ella's sick day covered by Kriz Petter on his rest day (rest-day OT)
+    ella_day = start + dt.timedelta(days=20)
+    ex("INSERT INTO ot_requests(agent_id,date,ot_type,start_time,end_time,hours,reason,status,covering_for,filed_on) "
+       "VALUES(?,?,?,?,?,?,?,?,?,?)", (ids["Kriz Petter"], str(ella_day), "Coverage OT", "13:00", "21:00", 8,
+                                      f"Covering Ella (ZEVO Messaging) [gap {ella_day}]", "Approved", ids["Ella"],
+                                      str(ella_day)))
+    # clock logs: from mid last month until now
+    sch = build_schedule(start, today)
+    ots = q("SELECT agent_id, date, start_time, end_time FROM ot_requests WHERE status='Approved'")
+    otk = {(int(a), d): (s_, e_) for a, d, s_, e_ in zip(ots.agent_id, ots.date, ots.start_time, ots.end_time)}
+    logs, absent, todo = [], [], []
+    for r in sch[sch.kind.isin(WORK_KINDS)].itertuples():
+        d = dt.date.fromisoformat(r.date)
+        s, e = shift_window(d, r.shift_start, r.shift_end)
+        aid = int(r.agent_id)
+        if s > now:
+            continue
+        roll = rnd.random()
+        if roll < 0.025:
+            absent.append((aid, r.date, "Absent"))
+            continue
+        if roll < 0.035:
+            absent.append((aid, r.date, "NCNS"))
+            continue
+        late = rnd.choice([0] * 14 + [4, 9, 16, 28, 45])
+        tin = s + dt.timedelta(minutes=late if late else -rnd.randint(0, 9))
+        tout = e + dt.timedelta(minutes=rnd.randint(0, 6))
+        o = otk.get((aid, r.date))
+        if o:
+            os_, oe = place_ot(d, o[0], o[1], (s, e))
+            if oe <= s:
+                tin = os_ - dt.timedelta(minutes=rnd.randint(0, 5))
+            else:
+                tout = oe + dt.timedelta(minutes=rnd.randint(0, 5)) - dt.timedelta(minutes=rnd.choice([0, 0, 0, 30]))
+        elif rnd.random() < 0.04:
+            tout = e - dt.timedelta(minutes=rnd.choice([30, 60, 90]))  # left early
+        elif rnd.random() < 0.05:
+            tout = e + dt.timedelta(minutes=rnd.choice([20, 35, 45]))  # stayed without approved OT
+        bs = s + (e - s) / 2 + dt.timedelta(minutes=rnd.randint(-40, 40))
+        be = bs + dt.timedelta(minutes=30 + rnd.choice([0] * 9 + [6, 12]))
+        src = "demo"
+        logs.append((aid, r.date, "login", tin.isoformat(), src))
+        if bs < now:
+            logs.append((aid, r.date, "break_start", bs.isoformat(), src))
+        if be < now:
+            logs.append((aid, r.date, "break_end", be.isoformat(), src))
+        if tout < now:
+            logs.append((aid, r.date, "logout", tout.isoformat(), src))
+        todo.append((aid, r.date))
+    exmany("INSERT INTO time_logs(agent_id,shift_date,event,ts,source) VALUES(?,?,?,?,?)", logs)
+    for aid, d in todo:
+        rebuild_attendance(aid, d)
+    for aid, d, stt in absent:
+        save_attendance(aid, d, None, None, stt, 0, 0, 0, "")
+    # payroll: last two cutoffs (older one already sent to accounting)
+    past = [c for c in payroll_cutoffs(today, back=2, ahead=0) if c <= today][-2:]
+    for k, c in enumerate(past):
+        payroll_generate(c, by="auto (12:00 AM CT)")
+        if k == 0:
+            ex("UPDATE payroll_runs SET status='Final', finalized_at=?, finalized_by=? WHERE run_id=?",
+               (f"{c}T17:32:00", "admin", str(c)))
+    return len(ag)
+
+
 def page_settings():
     st.header("⚙️ Settings")
     with st.form("settings"):
@@ -1990,16 +2146,23 @@ def page_settings():
                     STORE.mark_dirty(t)
             st.success("Restored.")
     st.subheader("Demo data")
-    if st.button("Load sample data (3 accounts, 22 agents, 2 weeks of attendance)"):
-        load_sample_data()
-        st.success("Sample data loaded — check the Dashboard.")
+    st.caption("**ZEVO demo**: your team's first names with made-up schedules, about a month of clock logs, leaves, "
+               f"OT, chat volume and two payroll reports. Every demo agent can sign in with password "
+               f"`{DEMO_PASSWORD}` (username = first name, e.g. `stella`, `kriz.petter`). "
+               "**This replaces all current data** — wipe it before going live.")
+    c = st.columns([2, 3])
+    ok_demo = c[0].checkbox("Replace all data with the ZEVO demo", key="demo_ok")
+    if c[1].button("🧪 Load ZEVO demo data", disabled=not ok_demo):
+        with st.spinner("Building demo data…"):
+            n = load_zevo_demo()
+        st.success(f"Demo loaded — {n} agents. Try Live Floor, Coverage Finder, Interval Planner and Payroll.")
+    with st.expander("Other sample data"):
+        if st.button("Load generic sample data (3 accounts, 22 agents, 2 weeks of attendance)"):
+            load_sample_data()
+            st.success("Sample data loaded — check the Dashboard.")
     with st.expander("Danger zone"):
         if st.checkbox("I understand this deletes everything except admin logins") and st.button("Wipe all data"):
-            for t in ("attendance", "leaves", "ot_requests", "schedule_overrides", "agents", "accounts", "interval_volume",
-                      "time_logs", "schedule_changes", "payroll_lines", "payroll_runs"):
-                ex(f"DELETE FROM {t}")
-            ex("DELETE FROM users WHERE role='agent'")  # agent logins point at roster rows that are now gone
-            ex("DELETE FROM sessions WHERE username NOT IN (SELECT username FROM users)")
+            wipe_all_data()
             st.success("All data deleted. Admin logins were kept; agent logins were removed — recreate them under "
                        "**Users** after importing your roster.")
 
