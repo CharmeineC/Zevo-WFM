@@ -4425,7 +4425,9 @@ def payroll_timesheet(run, lines):
         sub["Adjustment from"] = adj_from
         ren["Total"] = round(sum(v for k, v in ren.items() if k in dcols and isinstance(v, (int, float))), 2)
         otr["OT total"] = round(ot_sum, 2)
-        sub_rows.append(sub), ren_rows.append(ren), ot_rows.append(otr)
+        sub_rows.append(sub)
+        ren_rows.append(ren)
+        ot_rows.append(otr)
     return days, pd.DataFrame(sub_rows), pd.DataFrame(ren_rows), pd.DataFrame(ot_rows)
 
 
