@@ -96,7 +96,7 @@ if USE_SHEETS:
 else:
     DB_PATH = os.environ.get("WFM_DB", "wfm.db")
 TABLES = ["accounts", "agents", "schedule_overrides", "attendance", "leaves", "ot_requests", "settings",
-          "interval_volume", "users", "time_logs", "sessions", "schedule_changes"]
+          "interval_volume", "users", "time_logs", "sessions", "schedule_changes", "payroll_runs", "payroll_lines"]
 APPEND_TABLES = {"time_logs"}  # insert-only logs are appended to the sheet instead of rewriting the tab
 _WRITE_RE = re.compile(r"^\s*(?:INSERT(?:\s+OR\s+\w+)?\s+INTO|UPDATE|DELETE\s+FROM)\s+(\w+)", re.I)
 DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
@@ -188,6 +188,13 @@ CREATE TABLE IF NOT EXISTS ot_requests(
   start_time TEXT, end_time TEXT, hours REAL, reason TEXT, status TEXT DEFAULT 'Pending',
   covering_for INTEGER, filed_on TEXT, for_account TEXT);
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS payroll_runs(
+  run_id TEXT PRIMARY KEY, period_start TEXT, period_end TEXT, cutoff TEXT, status TEXT,
+  generated_at TEXT, generated_by TEXT, finalized_at TEXT, finalized_by TEXT, note TEXT);
+CREATE TABLE IF NOT EXISTS payroll_lines(
+  run_id TEXT, agent_id INTEGER, date TEXT, basis TEXT, schedule TEXT, time_in TEXT, time_out TEXT,
+  status TEXT, late_min REAL, undertime_min REAL, logged_hrs REAL, reg_calc REAL, ot_calc REAL,
+  reg_final REAL, ot_final REAL, flags TEXT, note TEXT, PRIMARY KEY(run_id, agent_id, date, basis));
 """
 
 
@@ -1989,7 +1996,7 @@ def page_settings():
     with st.expander("Danger zone"):
         if st.checkbox("I understand this deletes everything except admin logins") and st.button("Wipe all data"):
             for t in ("attendance", "leaves", "ot_requests", "schedule_overrides", "agents", "accounts", "interval_volume",
-                      "time_logs"):
+                      "time_logs", "schedule_changes", "payroll_lines", "payroll_runs"):
                 ex(f"DELETE FROM {t}")
             ex("DELETE FROM users WHERE role='agent'")  # agent logins point at roster rows that are now gone
             ex("DELETE FROM sessions WHERE username NOT IN (SELECT username FROM users)")
@@ -3973,6 +3980,371 @@ def page_clock_logs(acct):
                 rerun()
 
 
+# ----------------------------------------------------------------- payroll
+PAYROLL_LOOKBACK_DAYS = 75  # how far back earlier payroll days are re-checked for adjustments
+
+
+def payroll_period(run_day):
+    """Run on the 10th → 1st–15th; run on the 25th → 16th–end of month. Returns (start, end)."""
+    if run_day.day == 10:
+        return run_day.replace(day=1), run_day.replace(day=15)
+    nxt = (run_day.replace(day=28) + dt.timedelta(days=4)).replace(day=1)
+    return run_day.replace(day=16), nxt - ONE_DAY
+
+
+def payroll_cutoffs(around, back=4, ahead=1):
+    """Payroll run dates (10th / 25th) near `around`, oldest first."""
+    out, y, m = [], around.year, around.month
+    for k in range(-back, ahead + 1):
+        mm = (y * 12 + m - 1) + k
+        for d in (10, 25):
+            out.append(dt.date(mm // 12, mm % 12 + 1, d))
+    return sorted(out)
+
+
+def _hm_to_dt(day, hm, ref):
+    """HH:MM on or around `day`, closest to the reference datetime."""
+    if not hm or not re.fullmatch(r"\d{1,2}:\d{2}", str(hm)):
+        return None
+    return closest_dt(day, str(hm).zfill(5), ref)
+
+
+def payroll_compute(d1, d2, cutoff, agent_ids=None):
+    """Paid hours per agent per day for d1..d2.
+    Days before `cutoff` use what actually happened (scheduled hours − late − undertime, breaks paid,
+    approved OT that was actually worked). Days from `cutoff` on are projected from the schedule
+    (incl. permanent/one-off changes and approved leave) + approved OT."""
+    sch = build_schedule(d1, d2)
+    if agent_ids is not None:
+        sch = sch[sch.agent_id.isin(list(agent_ids))]
+    att = q("SELECT * FROM attendance WHERE date BETWEEN ? AND ?", (str(d1), str(d2)))
+    att = {(int(r.agent_id), str(r.date)): r for r in att.itertuples()}
+    ots = q("SELECT agent_id, date, ot_type, start_time, end_time, hours FROM ot_requests "
+            "WHERE status='Approved' AND date BETWEEN ? AND ?", (str(d1), str(d2)))
+    block = max(1.0, setting("ot_block_min"))
+    rows = []
+    for r in sch.itertuples():
+        aid, ds = int(r.agent_id), str(r.date)
+        d = dt.date.fromisoformat(ds)
+        actual = d < cutoff
+        flags = []
+        s = e = None
+        sched_h = 0.0
+        if r.kind in WORK_KINDS and r.shift_start and r.shift_end:
+            s, e = shift_window(d, r.shift_start, r.shift_end)
+            sched_h = (e - s).total_seconds() / 3600
+        is_rd_ot = r.kind == "Work (RD OT)"
+        label = (f"{r.shift_start}-{r.shift_end}" if s else "") + ("" if r.kind == "Work" else f" ({r.kind})" if s
+                                                                     else r.kind)
+        if r.kind == "Leave":
+            label = f"Leave ({r.note})" if r.note else "Leave"
+        a = att.get((aid, ds))
+        tin = tout = None
+        status, late, ut = "", 0.0, 0.0
+        if a is not None:
+            status = a.status or ""
+            ref = s or dt.datetime.combine(d, dt.time(12))
+            tin = _hm_to_dt(d, a.time_in, ref)
+            tout = _hm_to_dt(d, a.time_out, (tin or ref) + dt.timedelta(hours=max(sched_h, 1)))
+            if tin and tout and tout <= tin:
+                tout += ONE_DAY
+            late, ut = float(a.late_min or 0), float(a.undertime_min or 0)
+        logged = round((tout - tin).total_seconds() / 3600, 2) if tin and tout else None
+
+        reg = ot = 0.0
+        # --- scheduled hours
+        if s is not None:
+            if not actual:
+                worked = sched_h
+            elif a is None:
+                worked = 0.0
+                flags.append("No attendance record")
+            elif status in ABSENT_STATUS:
+                worked = 0.0
+            else:
+                worked = max(0.0, sched_h - late / 60 - ut / 60)
+                if tin and not tout:
+                    flags.append("No log out")
+                if not tin and status not in ("", None):
+                    flags.append("No clock times")
+            if is_rd_ot:
+                ot += worked
+            else:
+                reg += worked
+        elif actual and a is not None and tin and r.kind not in ("Leave",):
+            if not len(ots[(ots.agent_id == aid) & (ots.date == ds)]):
+                flags.append("Worked on a day off without approved OT (not paid)")
+
+        # --- approved OT (RD OT that already became a schedule override is counted above)
+        for o in ots[(ots.agent_id == aid) & (ots.date == ds)].itertuples():
+            if not (o.start_time and o.end_time):
+                continue
+            os_, oe = place_ot(d, o.start_time, o.end_time, (s, e) if s else None)
+            if is_rd_ot and s is not None and os_ < e and s < oe:
+                continue
+            req_h = (oe - os_).total_seconds() / 3600
+            if not actual:
+                ot += req_h
+            elif tin and tout:
+                ov = (min(oe, tout) - max(os_, tin)).total_seconds() / 60
+                ov = max(0.0, ov) // block * block
+                ot += ov / 60
+                if ov / 60 < req_h - 0.01:
+                    flags.append(f"Approved OT {o.start_time}-{o.end_time}: {ov / 60:g}h of {req_h:g}h worked")
+            elif a is not None and status not in ABSENT_STATUS and status:
+                ot += req_h
+                flags.append(f"OT {o.start_time}-{o.end_time} counted without clock times")
+            else:
+                flags.append(f"Approved OT {o.start_time}-{o.end_time} not worked")
+        if a is not None and actual and float(a.ot_min or 0) > 0 and ot == 0 and not is_rd_ot:
+            flags.append(f"{int(a.ot_min)} min extra time without approved OT (not paid)")
+        if not s and reg == 0 and ot == 0 and not flags and r.kind != "Leave":
+            continue  # rest day with nothing to pay — keep the report short
+        rows.append(dict(agent_id=aid, date=ds, basis="Actual" if actual else "Projected", schedule=label.strip(),
+                         time_in=f"{tin:%H:%M}" if tin else "", time_out=f"{tout:%H:%M}" if tout else "",
+                         status=status if actual else "", late_min=late if actual else 0,
+                         undertime_min=ut if actual else 0, logged_hrs=logged if actual else None,
+                         reg_calc=round(reg, 2), ot_calc=round(ot, 2), flags="; ".join(flags)))
+    return pd.DataFrame(rows, columns=["agent_id", "date", "basis", "schedule", "time_in", "time_out", "status",
+                                       "late_min", "undertime_min", "logged_hrs", "reg_calc", "ot_calc", "flags"])
+
+
+def payroll_build(run_day):
+    """All lines for the run on `run_day`: actual + projected days of this period, plus adjustments
+    for earlier payroll days whose hours changed since they were reported."""
+    p1, p2 = payroll_period(run_day)
+    lines = payroll_compute(p1, p2, run_day)
+    since = p1 - dt.timedelta(days=PAYROLL_LOOKBACK_DAYS)
+    prior = q("SELECT run_id, period_start, period_end FROM payroll_runs WHERE run_id<? AND period_end>=? "
+              "AND period_end<?", (str(run_day), str(since), str(p1)))
+    adj = []
+    if len(prior):
+        prev = q("SELECT l.agent_id, l.date, SUM(l.reg_calc) reg, SUM(l.ot_calc) ot FROM payroll_lines l "
+                 "WHERE l.run_id IN (%s) GROUP BY l.agent_id, l.date" % ",".join("?" * len(prior)),
+                 tuple(prior.run_id))
+        prev_map = {(int(r.agent_id), str(r.date)): (float(r.reg or 0), float(r.ot or 0)) for r in prev.itertuples()}
+        cur_map = {}
+        for r in prior.itertuples():  # what those earlier days add up to now
+            cur = payroll_compute(dt.date.fromisoformat(r.period_start), dt.date.fromisoformat(r.period_end), run_day)
+            cur_map.update({(int(c.agent_id), str(c.date)): c for c in cur.itertuples()})
+        for key in sorted(set(prev_map) | set(cur_map), key=lambda k: (k[1], k[0])):
+            was_r, was_o = prev_map.get(key, (0.0, 0.0))
+            cur = cur_map.get(key)
+            dr = round((cur.reg_calc if cur is not None else 0) - was_r, 2)
+            do = round((cur.ot_calc if cur is not None else 0) - was_o, 2)
+            if abs(dr) < 0.01 and abs(do) < 0.01:
+                continue
+            g = (lambda f, dflt="": getattr(cur, f) if cur is not None else dflt)
+            adj.append(dict(agent_id=key[0], date=key[1], basis="Adjustment", schedule=g("schedule"),
+                            time_in=g("time_in"), time_out=g("time_out"), status=g("status"),
+                            late_min=g("late_min", 0), undertime_min=g("undertime_min", 0),
+                            logged_hrs=g("logged_hrs", None), reg_calc=dr, ot_calc=do,
+                            flags=f"Prior payroll had {was_r:g}h reg / {was_o:g}h OT for this day"
+                                  + (f"; {cur.flags}" if cur is not None and cur.flags else "")))
+    if adj:
+        lines = pd.concat([lines, pd.DataFrame(adj)], ignore_index=True)
+    lines["reg_final"], lines["ot_final"], lines["note"] = lines.reg_calc, lines.ot_calc, ""
+    return lines
+
+
+def payroll_generate(run_day, by="auto"):
+    """Create (or rebuild a draft of) the payroll report for the run on `run_day`."""
+    ex_run = q("SELECT status FROM payroll_runs WHERE run_id=?", (str(run_day),))
+    if len(ex_run) and ex_run.status.iloc[0] == "Final":
+        return False, "This payroll is already final — it can't be regenerated."
+    p1, p2 = payroll_period(run_day)
+    lines = payroll_build(run_day)
+    ex("DELETE FROM payroll_lines WHERE run_id=?", (str(run_day),))
+    ex("INSERT OR REPLACE INTO payroll_runs(run_id,period_start,period_end,cutoff,status,generated_at,generated_by) "
+       "VALUES(?,?,?,?,?,?,?)", (str(run_day), str(p1), str(p2), f"{run_day} 00:00", "Draft",
+                                  now_site().isoformat(timespec="seconds"), by))
+    if len(lines):
+        cols = ["agent_id", "date", "basis", "schedule", "time_in", "time_out", "status", "late_min", "undertime_min",
+                "logged_hrs", "reg_calc", "ot_calc", "reg_final", "ot_final", "flags", "note"]
+        vals = [[str(run_day)] + [None if (isinstance(v, float) and math.isnan(v)) else v for v in row]
+                for row in lines[cols].itertuples(index=False)]
+        exmany(f"INSERT INTO payroll_lines(run_id,{','.join(cols)}) VALUES(?{',?' * len(cols)})", vals)
+    return True, f"Payroll for {p1:%b %d}–{p2:%b %d} generated ({len(lines)} lines)."
+
+
+def payroll_auto():
+    """Runs on every page load: once a payroll cutoff (12:00 AM CT on the 10th / 25th) has passed,
+    lock that report automatically. Only for cutoffs in the last 3 days so old periods aren't back-filled."""
+    now = now_site()
+    due = [c for c in payroll_cutoffs(now.date(), back=1, ahead=0)
+           if dt.datetime.combine(c, dt.time()) <= now < dt.datetime.combine(c, dt.time()) + 3 * ONE_DAY]
+    for c in due:
+        if not len(q("SELECT 1 FROM payroll_runs WHERE run_id=?", (str(c),))):
+            try:
+                payroll_generate(c, by="auto (12:00 AM CT)")
+            except Exception:  # never block someone's page because of payroll
+                pass
+
+
+def payroll_tables(run_id):
+    lines = q("SELECT l.*, a.emp_id, a.name, a.account FROM payroll_lines l LEFT JOIN agents a ON a.id=l.agent_id "
+              "WHERE l.run_id=? ORDER BY a.name, l.date, l.basis", (run_id,))
+    for c in ("reg_calc", "ot_calc", "reg_final", "ot_final", "logged_hrs"):
+        lines[c] = pd.to_numeric(lines[c], errors="coerce")
+    if lines.empty:
+        return lines, pd.DataFrame()
+    lines["day"] = pd.to_datetime(lines.date).dt.strftime("%a")
+    g = lines.groupby(["agent_id", "emp_id", "name", "account"], dropna=False)
+
+    def part(basis, col):
+        return lines[lines.basis == basis].groupby("agent_id")[col].sum()
+    summ = g.size().reset_index()[["agent_id", "emp_id", "name", "account"]]
+    for basis, tag in (("Actual", "actual"), ("Projected", "projected"), ("Adjustment", "adj")):
+        summ[f"{tag}_reg"] = summ.agent_id.map(part(basis, "reg_final")).fillna(0).round(2)
+        summ[f"{tag}_ot"] = summ.agent_id.map(part(basis, "ot_final")).fillna(0).round(2)
+    summ["total_reg"] = (summ.actual_reg + summ.projected_reg + summ.adj_reg).round(2)
+    summ["total_ot"] = (summ.actual_ot + summ.projected_ot + summ.adj_ot).round(2)
+    summ["total_hrs"] = (summ.total_reg + summ.total_ot).round(2)
+    summ["logged_hrs_actual_days"] = summ.agent_id.map(part("Actual", "logged_hrs")).fillna(0).round(2)
+    summ["review_flags"] = summ.agent_id.map(lines[lines["flags"].fillna("") != ""].groupby("agent_id").size()) \
+        .fillna(0).astype(int)
+    return lines, summ.sort_values("name").reset_index(drop=True)
+
+
+def payroll_excel(run, lines, summ):
+    import io
+    buf = io.BytesIO()
+    sv = lambda v: "" if v is None or (isinstance(v, float) and math.isnan(v)) else str(v)
+    head = pd.DataFrame({"": ["Pay period", "Cutoff", "Status", "Generated", "Finalized"],
+                         " ": [f"{run.period_start} to {run.period_end}", f"{run.cutoff} CT", run.status,
+                               f"{run.generated_at} ({run.generated_by})",
+                               (f"{sv(run.finalized_at)} by {sv(run.finalized_by)}" if sv(run.finalized_by) else "")]})
+    s_cols = {"emp_id": "Username/Emp ID", "name": "Name", "account": "Account", "actual_reg": "Actual reg hrs",
+              "actual_ot": "Actual OT hrs", "projected_reg": "Projected reg hrs", "projected_ot": "Projected OT hrs",
+              "adj_reg": "Prior-period adj reg hrs", "adj_ot": "Prior-period adj OT hrs", "total_reg": "TOTAL reg hrs",
+              "total_ot": "TOTAL OT hrs", "total_hrs": "TOTAL hrs", "logged_hrs_actual_days": "Logged hrs (actual days)",
+              "review_flags": "Items to review"}
+    d_cols = {"name": "Name", "emp_id": "Username/Emp ID", "date": "Date", "day": "Day", "basis": "Basis",
+              "schedule": "Schedule", "time_in": "In", "time_out": "Out", "status": "Status", "late_min": "Late (min)",
+              "undertime_min": "Undertime (min)", "logged_hrs": "Logged hrs", "reg_calc": "Reg hrs (calc)",
+              "ot_calc": "OT hrs (calc)", "reg_final": "Reg hrs (paid)", "ot_final": "OT hrs (paid)",
+              "flags": "Review", "note": "Note"}
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        head.to_excel(xw, sheet_name="Summary", index=False, header=False)
+        summ[list(s_cols)].rename(columns=s_cols).to_excel(xw, sheet_name="Summary", index=False, startrow=7)
+        lines[list(d_cols)].rename(columns=d_cols).to_excel(xw, sheet_name="Daily detail", index=False)
+        for ws in xw.book.worksheets:
+            for col in ws.columns:
+                width = max(len(str(c.value or "")) for c in col[:200])
+                ws.column_dimensions[col[0].column_letter].width = min(max(10, width + 2), 45)
+    return buf.getvalue()
+
+
+def page_payroll(acct):
+    st.header("💵 Payroll")
+    st.caption("Sent to accounting on the **10th** (covers 1st–15th) and the **25th** (covers 16th–end of month). "
+               "The report locks automatically at **12:00 AM Central** on those days. Days before the cutoff use "
+               "what actually happened — scheduled hours minus late and undertime (breaks are paid) plus approved OT "
+               "that was worked. Days after the cutoff are projected from the schedule, approved leave and approved OT. "
+               "Anything that changes later shows up as a **prior-period adjustment** on the next payroll.")
+    runs = q("SELECT * FROM payroll_runs ORDER BY run_id DESC")
+    today = today_site()
+    cands = [c for c in payroll_cutoffs(today, back=3, ahead=0) if c <= today]
+    have = set(runs.run_id) if len(runs) else set()
+    with st.expander("➕ Generate a payroll report", expanded=runs.empty):
+        missing = [c for c in reversed(cands) if str(c) not in have]
+        if not missing:
+            st.caption("All recent payroll reports exist. Open a draft below to recalculate it.")
+        else:
+            fmt = lambda c: f"Run {c:%b %d} · covers {payroll_period(c)[0]:%b %d}–{payroll_period(c)[1]:%b %d}"
+            pick = st.selectbox("Payroll", missing, format_func=fmt, key="pr_new")
+            st.caption("Normally this happens on its own at 12:00 AM CT. Use this for a missed or past period.")
+            if st.button("Generate", type="primary", key="pr_gen"):
+                ok, msg = payroll_generate(pick, by=f"admin:{current_user()['username']}")
+                (st.success if ok else st.error)(msg)
+                rerun()
+    if runs.empty:
+        st.info("No payroll reports yet.")
+        return
+    lab = {r.run_id: f"{dt.date.fromisoformat(r.period_start):%b %d}–{dt.date.fromisoformat(r.period_end):%b %d, %Y}"
+                     f" · sent {dt.date.fromisoformat(r.run_id):%b %d} · {r.status}" for r in runs.itertuples()}
+    rid = st.selectbox("Payroll report", list(lab), format_func=lab.get, key="pr_run")
+    run = runs[runs.run_id == rid].iloc[0]
+    lines, summ = payroll_tables(rid)
+    if acct != "All accounts" and len(lines):
+        lines, summ = lines[lines.account == acct], summ[summ.account == acct]
+    final = run.status == "Final"
+    k = st.columns(5)
+    k[0].metric("Status", "✅ Final" if final else "📝 Draft")
+    k[1].metric("Agents", len(summ))
+    k[2].metric("Regular hrs", f"{summ.total_reg.sum():,.2f}" if len(summ) else "0")
+    k[3].metric("OT hrs", f"{summ.total_ot.sum():,.2f}" if len(summ) else "0")
+    k[4].metric("Items to review", int(summ.review_flags.sum()) if len(summ) else 0)
+    st.caption(f"Cutoff {run.cutoff} CT · actual days {run.period_start} to "
+               f"{dt.date.fromisoformat(rid) - ONE_DAY} · projected {rid} to {run.period_end} · generated "
+               f"{run.generated_at} by {run.generated_by}"
+               + (f" · finalized {run.finalized_at} by {run.finalized_by}" if final else ""))
+    if summ.empty:
+        st.info("Nothing to pay in this period.")
+        return
+    t1, t2, t3 = st.tabs(["Summary", "Daily detail & rounding", "Items to review"])
+    with t1:
+        st.dataframe(summ.drop(columns="agent_id"), hide_index=True, width="stretch", column_config={
+            "emp_id": "Username/Emp ID", "actual_reg": "Actual reg", "actual_ot": "Actual OT",
+            "projected_reg": "Projected reg", "projected_ot": "Projected OT", "adj_reg": "Adj reg",
+            "adj_ot": "Adj OT", "total_reg": "TOTAL reg", "total_ot": "TOTAL OT", "total_hrs": "TOTAL hrs",
+            "logged_hrs_actual_days": "Logged hrs (actual days)", "review_flags": "To review"})
+    with t2:
+        st.caption("**Reg/OT (calc)** is what the system worked out. **Paid** is what goes to accounting — "
+                   "round or correct it here before finalizing. Rounding doesn't create adjustments later; "
+                   "only real changes (attendance, OT, leave, schedule) do.")
+        view = lines[["name", "date", "day", "basis", "schedule", "time_in", "time_out", "status", "late_min",
+                      "undertime_min", "logged_hrs", "reg_calc", "ot_calc", "reg_final", "ot_final", "flags", "note",
+                      "agent_id"]]
+        if not final:
+            c = st.columns([2, 1, 3])
+            step = c[0].selectbox("Round paid hours to nearest", ["0.25 h", "0.5 h", "1 h"], key="pr_step")
+            if c[1].button("Apply rounding", key="pr_round"):
+                stp = float(step.split()[0])
+                for r in lines.itertuples():
+                    ex("UPDATE payroll_lines SET reg_final=?, ot_final=? WHERE run_id=? AND agent_id=? AND date=? "
+                       "AND basis=?", (round(round(r.reg_final / stp) * stp, 2), round(round(r.ot_final / stp) * stp, 2),
+                                      rid, int(r.agent_id), r.date, r.basis))
+                rerun()
+        ed = st.data_editor(view, hide_index=True, width="stretch", key=f"pr_ed_{rid}",
+                            disabled=final or [c for c in view.columns if c not in ("reg_final", "ot_final", "note")],
+                            column_config={"agent_id": None, "reg_calc": "Reg (calc)", "ot_calc": "OT (calc)",
+                                           "reg_final": st.column_config.NumberColumn("Reg (paid)", step=0.25),
+                                           "ot_final": st.column_config.NumberColumn("OT (paid)", step=0.25),
+                                           "logged_hrs": "Logged hrs", "late_min": "Late", "undertime_min": "UT",
+                                           "flags": "Review"})
+        if not final and st.button("💾 Save changes", key="pr_save"):
+            n = 0
+            for r in ed.itertuples():
+                ex("UPDATE payroll_lines SET reg_final=?, ot_final=?, note=? WHERE run_id=? AND agent_id=? AND date=? "
+                   "AND basis=?", (float(r.reg_final or 0), float(r.ot_final or 0), r.note or "", rid,
+                                  int(r.agent_id), r.date, r.basis))
+                n += 1
+            st.success("Saved.")
+            rerun()
+    with t3:
+        rev = lines[lines["flags"].fillna("") != ""][["name", "date", "basis", "schedule", "status", "reg_final",
+                                                   "ot_final", "flags"]]
+        if rev.empty:
+            st.success("Nothing flagged.")
+        else:
+            st.dataframe(rev, hide_index=True, width="stretch")
+    xls = payroll_excel(run, *payroll_tables(rid))
+    fname = f"payroll_{run.period_start}_to_{run.period_end}{'' if final else '_DRAFT'}.xlsx"
+    c = st.columns(3)
+    c[0].download_button("⬇️ Download Excel", xls, fname, width="stretch",
+                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    if not final:
+        if c[1].button("🔄 Recalculate draft", width="stretch", key="pr_recalc",
+                       help="Rebuilds the numbers from current data. Rounding and notes you made are reset."):
+            payroll_generate(dt.date.fromisoformat(rid), by=f"admin:{current_user()['username']}")
+            rerun()
+        if c[2].button("✅ Finalize (sent to accounting)", type="primary", width="stretch", key="pr_final"):
+            ex("UPDATE payroll_runs SET status='Final', finalized_at=?, finalized_by=? WHERE run_id=?",
+               (now_site().isoformat(timespec="seconds"), current_user()["username"], rid))
+            rerun()
+
+
 # ----------------------------------------------------------------- layout
 auth_gate()  # nothing below runs until someone is signed in
 USER = current_user()
@@ -3987,6 +4359,7 @@ ADMIN_PAGES = {
     "🧩 Coverage Finder": page_coverage,
     "⏰ Overtime": page_ot,
     "📈 Reports": page_reports,
+    "💵 Payroll": page_payroll,
     "👥 Roster & Accounts": lambda acct: page_roster(),
     "🔐 Users": page_users,
     "⚙️ Settings": lambda acct: page_settings(),
@@ -3998,6 +4371,7 @@ AGENT_PAGES = {
     "🔑 My password": lambda acct: page_change_password(),
 }
 PAGES = ADMIN_PAGES if is_admin() else AGENT_PAGES  # agents never get the admin pages
+payroll_auto()  # locks the 10th / 25th payroll at 12:00 AM CT — whoever opens the app first (agents work 24/7)
 if is_admin():
     sync_current_schedules()  # roster shows the permanent schedule in effect today (cheap; writes only on change)
 
