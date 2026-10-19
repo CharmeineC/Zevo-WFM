@@ -96,7 +96,7 @@ if USE_SHEETS:
 else:
     DB_PATH = os.environ.get("WFM_DB", "wfm.db")
 TABLES = ["accounts", "agents", "schedule_overrides", "attendance", "leaves", "ot_requests", "settings",
-          "interval_volume", "users", "time_logs", "sessions", "schedule_changes", "payroll_runs", "payroll_lines", "adjustments"]
+          "interval_volume", "users", "time_logs", "sessions", "schedule_changes", "adjustments"]
 APPEND_TABLES = {"time_logs"}  # insert-only logs are appended to the sheet instead of rewriting the tab
 _WRITE_RE = re.compile(r"^\s*(?:INSERT(?:\s+OR\s+\w+)?\s+INTO|UPDATE|DELETE\s+FROM)\s+(\w+)", re.I)
 DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
@@ -192,13 +192,6 @@ CREATE TABLE IF NOT EXISTS adjustments(
   id INTEGER PRIMARY KEY AUTOINCREMENT, agent_id INTEGER, shift_date TEXT, kind TEXT, reason TEXT, details TEXT,
   start_time TEXT, end_time TEXT, minutes REAL, makeup TEXT, makeup_start TEXT, makeup_end TEXT,
   status TEXT DEFAULT 'Pending', filed_at TEXT, decided_by TEXT, decided_at TEXT);
-CREATE TABLE IF NOT EXISTS payroll_runs(
-  run_id TEXT PRIMARY KEY, period_start TEXT, period_end TEXT, cutoff TEXT, status TEXT,
-  generated_at TEXT, generated_by TEXT, finalized_at TEXT, finalized_by TEXT, note TEXT);
-CREATE TABLE IF NOT EXISTS payroll_lines(
-  run_id TEXT, agent_id INTEGER, date TEXT, basis TEXT, schedule TEXT, time_in TEXT, time_out TEXT,
-  status TEXT, late_min REAL, undertime_min REAL, logged_hrs REAL, reg_calc REAL, ot_calc REAL,
-  reg_final REAL, ot_final REAL, flags TEXT, note TEXT, PRIMARY KEY(run_id, agent_id, date, basis));
 """
 
 
@@ -1718,11 +1711,109 @@ def page_ot(acct):
                      hide_index=True, width="stretch")
 
 
+def report_periods(today):
+    """Quick picks matching the payroll cut-offs (1st–15th, 16th–end)."""
+    first = today.replace(day=1)
+    end_m = (first + dt.timedelta(days=32)).replace(day=1) - ONE_DAY
+    prev_end = first - ONE_DAY
+    prev_first = prev_end.replace(day=1)
+    return {
+        f"1st–15th {first:%b}": (first, first.replace(day=15)),
+        f"16th–{end_m.day} {first:%b}": (first.replace(day=16), end_m),
+        f"1st–15th {prev_first:%b}": (prev_first, prev_first.replace(day=15)),
+        f"16th–{prev_end.day} {prev_first:%b}": (prev_first.replace(day=16), prev_end),
+        f"This month ({first:%b})": (first, end_m),
+        "Custom dates": None,
+    }
+
+
+def hours_grid(d1, d2, acct, include_projected):
+    """Agent × day hours (reg + OT) with leave codes — the layout TLs use for payroll."""
+    today = today_site()
+    last_actual = min(d2, today - ONE_DAY)
+    parts = []
+    if last_actual >= d1:
+        parts.append(daily_hours(d1, last_actual, today))
+    if include_projected and d2 >= today:
+        parts.append(daily_hours(max(d1, today), d2, max(d1, today)))
+    det = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=["agent_id", "date"])
+    ag = agents_df(False, acct)
+    det = det[det.agent_id.isin(ag.id)]
+    days = [d1 + dt.timedelta(days=i) for i in range((d2 - d1).days + 1)]
+    names = dict(zip(ag.id.astype(int), ag.name))
+    emp = dict(zip(ag.id.astype(int), ag.emp_id))
+    rows, ots = [], []
+    for aid in sorted(set(det.agent_id.astype(int)), key=lambda a: names.get(a, "")):
+        mine = det[det.agent_id == aid]
+        by = {str(r.date): r for r in mine.itertuples()}
+        row, otr = {"Name": names.get(aid, aid), "Username": emp.get(aid, "")}, {"Name": names.get(aid, aid)}
+        reg = ot = 0.0
+        flags = []
+        for d in days:
+            r = by.get(str(d))
+            key = f"{d:%a} {d.day}"
+            if r is None:
+                row[key], otr[key] = (0.0 if (d < today or include_projected) else None), None
+                continue
+            if str(r.schedule).startswith("Leave"):
+                row[key] = leave_abbrev(str(r.schedule))
+            else:
+                row[key] = round(r.reg_calc + r.ot_calc, 2)
+            otr[key] = round(r.ot_calc, 2) or None
+            reg, ot = reg + r.reg_calc, ot + r.ot_calc
+            if r.flags:
+                flags.append(f"{d:%-m/%-d}: {r.flags}")
+        row["Reg"], row["OT"], row["TOTAL"] = round(reg, 2), round(ot, 2), round(reg + ot, 2)
+        row["Notes"] = " | ".join(flags)
+        otr["OT total"] = round(ot, 2)
+        rows.append(row)
+        ots.append(otr)
+    grid, otg = pd.DataFrame(rows), pd.DataFrame(ots)
+    if len(det):
+        det = det.assign(name=det.agent_id.map(names), username=det.agent_id.map(emp))
+    return grid, otg, det, last_actual
+
+
+def reports_excel(sheets):
+    import io
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
+    from openpyxl.utils import get_column_letter as L
+    wb = Workbook()
+    wb.remove(wb.active)
+    for name, df in sheets.items():
+        ws = wb.create_sheet(name[:31])
+        for j, c in enumerate(df.columns, start=1):
+            cell = ws.cell(1, j, str(c))
+            cell.font, cell.fill = Font(bold=True), PatternFill("solid", fgColor="D9E1F2")
+            width = 7 if re.fullmatch(r"\w{3} \d{1,2}", str(c)) else min(max(10, len(str(c)) + 2), 50)
+            ws.column_dimensions[L(j)].width = 60 if c in ("Notes", "flags", "remarks") else width
+        for i, row in enumerate(df.itertuples(index=False), start=2):
+            for j, v in enumerate(row, start=1):
+                ws.cell(i, j, None if v is None or (isinstance(v, float) and math.isnan(v)) else v)
+        ws.freeze_panes = "C2" if "Name" in df.columns[:1] else "A2"
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
 def page_reports(acct):
     st.header("📈 Reports")
-    c = st.columns(2)
-    d1 = c[0].date_input("From", today_site().replace(day=1), key="r1")
-    d2 = c[1].date_input("To", today_site(), key="r2")
+    today = today_site()
+    presets = report_periods(today)
+    c = st.columns([2, 1, 1])
+    pick = c[0].selectbox("Period", list(presets), index=0 if today.day <= 15 else 1, key="r_period",
+                          help="1st–15th and 16th–end match the payroll cut-offs")
+    if presets[pick] is None:
+        d1 = c[1].date_input("From", today.replace(day=1), key="r1")
+        d2 = c[2].date_input("To", today, key="r2")
+    else:
+        d1, d2 = presets[pick]
+        c[1].markdown(f"**From**  \n{d1:%a %b %d, %Y}")
+        c[2].markdown(f"**To**  \n{d2:%a %b %d, %Y}")
+    if d2 < d1:
+        st.error("'To' is before 'From'.")
+        return
     sch = build_schedule(d1, d2, acct)
     if sch.empty:
         st.info("No data.")
@@ -1730,6 +1821,8 @@ def page_reports(acct):
     att = q("SELECT * FROM attendance WHERE date BETWEEN ? AND ?", (str(d1), str(d2)))
     ot = q("SELECT agent_id, SUM(hours) h FROM ot_requests WHERE status='Approved' AND date BETWEEN ? AND ? "
            "GROUP BY agent_id", (str(d1), str(d2)))
+    adj = q("SELECT agent_id, COUNT(*) n FROM adjustments WHERE status='Approved' AND shift_date BETWEEN ? AND ? "
+            "GROUP BY agent_id", (str(d1), str(d2)))
     m = sch.merge(att, on=["agent_id", "date"], how="left")
     g = m.groupby(["emp_id", "name", "account"])
     rep = pd.DataFrame({
@@ -1747,24 +1840,58 @@ def page_reports(acct):
         "agent_id": g.agent_id.first(),
     }).reset_index()
     rep["approved_ot_hrs"] = rep.agent_id.map(dict(zip(ot.agent_id, ot.h))).fillna(0)
+    rep["excused_adjustments"] = rep.agent_id.map(dict(zip(adj.agent_id, adj.n))).fillna(0).astype(int)
     logged = rep.present + rep.absent + rep.ncns
     rep["attendance_%"] = (100 * rep.present / logged.where(logged > 0)).round(1)
     rep["tardiness_%"] = (100 * rep.lates / rep.present.where(rep.present > 0)).round(1)
-    rep = rep.drop(columns="agent_id")
     c = st.columns(4)
     tot_logged = logged.sum()
     c[0].metric("Attendance", f"{100 * rep.present.sum() / tot_logged:.1f}%" if tot_logged else "—")
     c[1].metric("Lates", int(rep.lates.sum()))
     c[2].metric("Absent + NCNS", int(rep.absent.sum() + rep.ncns.sum()))
     c[3].metric("Approved OT hrs", f"{rep.approved_ot_hrs.sum():.1f}")
-    st.dataframe(rep, hide_index=True, width="stretch")
-    st.download_button("⬇️ Agent summary (CSV)", rep.to_csv(index=False), f"agent_summary_{d1}_{d2}.csv")
+
+    future = d2 >= today
+    inc = st.toggle("Include scheduled hours for days not worked yet (projected)", False, key="r_proj",
+                    disabled=not future, help="Scheduled shifts + approved OT; approved leave = 0")
+    grid, otg, det, last_actual = hours_grid(d1, d2, acct, inc and future)
+    if len(grid):
+        tot = dict(zip(grid.Name, grid.TOTAL))
+        rep["hours_total"] = rep.name.map(tot).fillna(0)
+    t1, t2, t3 = st.tabs(["Daily hours (for payroll)", "Agent summary", "Charts"])
+    with t1:
+        st.caption("Hours per day = scheduled hours − late − undertime (breaks are paid) + approved OT actually worked. "
+                   "Approved same-day adjustments: time missed is unpaid, make-up time is added. Leave shows its code. "
+                   + (f"Days after {last_actual:%b %d} are " + ("**projected** from the schedule." if inc and future
+                                                                 else "not counted yet.") if future else "")
+                   + " Everything here is a starting point — TLs adjust the final numbers in their own sheet.")
+        if grid.empty:
+            st.info("No hours in this period yet.")
+        else:
+            show = grid.map(lambda v: "" if v is None or (isinstance(v, float) and math.isnan(v))
+                            else f"{v:g}" if isinstance(v, (int, float)) else str(v))
+            st.dataframe(show, hide_index=True, width="stretch")
+    with t2:
+        st.dataframe(rep.drop(columns="agent_id"), hide_index=True, width="stretch")
+    with t3:
+        st.subheader("Top tardiness")
+        st.bar_chart(rep.set_index("name").late_min_total.sort_values(ascending=False).head(15))
     raw = m[m.status.notna()][["date", "emp_id", "name", "account", "shift_start", "shift_end", "time_in",
                               "time_out", "status", "late_min", "undertime_min", "break_min", "overbreak_min",
                               "ot_min", "remarks"]]
-    st.download_button("⬇️ Raw attendance log (CSV)", raw.to_csv(index=False), f"attendance_{d1}_{d2}.csv")
-    st.subheader("Top tardiness")
-    st.bar_chart(rep.set_index("name").late_min_total.sort_values(ascending=False).head(15))
+    det_cols = ["name", "username", "date", "basis", "schedule", "time_in", "time_out", "status", "late_min",
+                "undertime_min", "logged_hrs", "reg_calc", "ot_calc", "flags"]
+    detail = det[det_cols].rename(columns={"reg_calc": "reg_hrs", "ot_calc": "ot_hrs"}).sort_values(["name", "date"]) \
+        if len(det) else pd.DataFrame(columns=det_cols)
+    xls = reports_excel({"Daily hours": grid, "OT by day": otg, "Agent summary": rep.drop(columns="agent_id"),
+                         "Daily detail": detail, "Raw attendance": raw})
+    c = st.columns(3)
+    c[0].download_button("⬇️ Excel (all tabs)", xls, f"attendance_{d1}_to_{d2}.xlsx", type="primary",
+                         width="stretch", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    c[1].download_button("⬇️ Agent summary (CSV)", rep.drop(columns="agent_id").to_csv(index=False),
+                         f"agent_summary_{d1}_{d2}.csv", width="stretch")
+    c[2].download_button("⬇️ Raw attendance log (CSV)", raw.to_csv(index=False), f"attendance_{d1}_{d2}.csv",
+                         width="stretch")
 
 
 def page_roster():
@@ -1923,7 +2050,7 @@ def load_sample_data():
 
 def wipe_all_data():
     for t in ("attendance", "leaves", "ot_requests", "schedule_overrides", "agents", "accounts", "interval_volume",
-              "time_logs", "schedule_changes", "payroll_lines", "payroll_runs", "adjustments"):
+              "time_logs", "schedule_changes", "adjustments"):
         ex(f"DELETE FROM {t}")
     ex("DELETE FROM users WHERE role='agent'")  # agent logins point at roster rows that are now gone
     ex("DELETE FROM sessions WHERE username NOT IN (SELECT username FROM users)")
@@ -1949,7 +2076,7 @@ ZEVO_DEMO_TEAM = [
 
 def load_zevo_demo():
     """Replace everything with made-up ZEVO-style demo data: the team's first names with invented schedules,
-    ~a month of clock logs, leaves, OT, chat volume and two payroll runs."""
+    ~a month of clock logs, leaves, OT and chat volume."""
     rnd = random.Random(2026)
     wipe_all_data()
     today, now = today_site(), now_site()
@@ -2078,13 +2205,6 @@ def load_zevo_demo():
            (int(r.agent_id), str(today), "Undertime", "Lost power", "Power outage in our area",
             f"{e_ - dt.timedelta(hours=2):%H:%M}", f"{e_:%H:%M}", 120, "Yes", f"{e_:%H:%M}",
             f"{e_ + dt.timedelta(hours=1):%H:%M}", "Pending", now.isoformat(timespec="seconds")))
-    # payroll: last two cutoffs (older one already sent to accounting)
-    past = [c for c in payroll_cutoffs(today, back=2, ahead=0) if c <= today][-2:]
-    for k, c in enumerate(past):
-        payroll_generate(c, by="auto (12:00 AM CT)")
-        if k == 0:
-            ex("UPDATE payroll_runs SET status='Final', finalized_at=?, finalized_by=? WHERE run_id=?",
-               (f"{c}T17:32:00", "admin", str(c)))
     return len(ag)
 
 
@@ -2162,7 +2282,7 @@ def page_settings():
             st.success("Restored.")
     st.subheader("Demo data")
     st.caption("**ZEVO demo**: your team's first names with made-up schedules, about a month of clock logs, leaves, "
-               f"OT, chat volume and two payroll reports. Every demo agent can sign in with password "
+               f"OT and chat volume. Every demo agent can sign in with password "
                f"`{DEMO_PASSWORD}` (username = first name, e.g. `stella`, `kriz.petter`). "
                "**This replaces all current data** — wipe it before going live.")
     c = st.columns([2, 3])
@@ -2170,7 +2290,7 @@ def page_settings():
     if c[1].button("🧪 Load ZEVO demo data", disabled=not ok_demo):
         with st.spinner("Building demo data…"):
             n = load_zevo_demo()
-        st.success(f"Demo loaded — {n} agents. Try Live Floor, Coverage Finder, Interval Planner and Payroll.")
+        st.success(f"Demo loaded — {n} agents. Try Live Floor, Coverage Finder, Interval Planner and Reports.")
     with st.expander("Other sample data"):
         if st.button("Load generic sample data (3 accounts, 22 agents, 2 weeks of attendance)"):
             load_sample_data()
@@ -4395,28 +4515,7 @@ def page_clock_logs(acct):
                 rerun()
 
 
-# ----------------------------------------------------------------- payroll
-PAYROLL_LOOKBACK_DAYS = 75  # how far back earlier payroll days are re-checked for adjustments
-
-
-def payroll_period(run_day):
-    """Run on the 10th → 1st–15th; run on the 25th → 16th–end of month. Returns (start, end)."""
-    if run_day.day == 10:
-        return run_day.replace(day=1), run_day.replace(day=15)
-    nxt = (run_day.replace(day=28) + dt.timedelta(days=4)).replace(day=1)
-    return run_day.replace(day=16), nxt - ONE_DAY
-
-
-def payroll_cutoffs(around, back=4, ahead=1):
-    """Payroll run dates (10th / 25th) near `around`, oldest first."""
-    out, y, m = [], around.year, around.month
-    for k in range(-back, ahead + 1):
-        mm = (y * 12 + m - 1) + k
-        for d in (10, 25):
-            out.append(dt.date(mm // 12, mm % 12 + 1, d))
-    return sorted(out)
-
-
+# ----------------------------------------------------------------- daily hours (for TL payroll)
 def _hm_to_dt(day, hm, ref):
     """HH:MM on or around `day`, closest to the reference datetime."""
     if not hm or not re.fullmatch(r"\d{1,2}:\d{2}", str(hm)):
@@ -4424,7 +4523,7 @@ def _hm_to_dt(day, hm, ref):
     return closest_dt(day, str(hm).zfill(5), ref)
 
 
-def payroll_compute(d1, d2, cutoff, agent_ids=None):
+def daily_hours(d1, d2, cutoff, agent_ids=None):
     """Paid hours per agent per day for d1..d2.
     Days before `cutoff` use what actually happened (scheduled hours − late − undertime, breaks paid,
     approved OT that was actually worked). Days from `cutoff` on are projected from the schedule
@@ -4513,14 +4612,14 @@ def payroll_compute(d1, d2, cutoff, agent_ids=None):
                 elif len(sess) > 1:
                     gap = sched_h * 60 - late - ut - _covered(sess, s, e)
                     if gap > setting("grace_min"):
-                        flags.append(f"Logged out {int(gap)} min during the shift (paid — no adjustment filed)")
+                        flags.append(f"Logged out {int(gap)} min during the shift (counted — no adjustment filed)")
             if is_rd_ot:
                 ot += worked
             else:
                 reg += worked
         elif actual and a is not None and tin and r.kind not in ("Leave",):
             if not len(ots[(ots.agent_id == aid) & (ots.date == ds)]):
-                flags.append("Worked on a day off without approved OT (not paid)")
+                flags.append("Worked on a day off without approved OT (not counted)")
 
         # --- approved OT (RD OT that already became a schedule override is counted above)
         for o in ots[(ots.agent_id == aid) & (ots.date == ds)].itertuples():
@@ -4545,7 +4644,7 @@ def payroll_compute(d1, d2, cutoff, agent_ids=None):
                 flags.append(f"Approved OT {o.start_time}-{o.end_time} not worked")
         if a is not None and actual and float(a.ot_min or 0) > 0 and ot == 0 and not is_rd_ot \
                 and (str(aid), ds) not in adj_days:
-            flags.append(f"{int(a.ot_min)} min extra time without approved OT (not paid)")
+            flags.append(f"{int(a.ot_min)} min extra time without approved OT (not counted)")
         if not s and reg == 0 and ot == 0 and not flags and r.kind != "Leave":
             continue  # rest day with nothing to pay — keep the report short
         rows.append(dict(agent_id=aid, date=ds, basis="Actual" if actual else "Projected", schedule=label.strip(),
@@ -4555,399 +4654,6 @@ def payroll_compute(d1, d2, cutoff, agent_ids=None):
                          reg_calc=round(reg, 2), ot_calc=round(ot, 2), flags="; ".join(flags)))
     return pd.DataFrame(rows, columns=["agent_id", "date", "basis", "schedule", "time_in", "time_out", "status",
                                        "late_min", "undertime_min", "logged_hrs", "reg_calc", "ot_calc", "flags"])
-
-
-def payroll_build(run_day):
-    """All lines for the run on `run_day`: actual + projected days of this period, plus adjustments
-    for earlier payroll days whose hours changed since they were reported."""
-    p1, p2 = payroll_period(run_day)
-    lines = payroll_compute(p1, p2, run_day)
-    since = p1 - dt.timedelta(days=PAYROLL_LOOKBACK_DAYS)
-    prior = q("SELECT run_id, period_start, period_end FROM payroll_runs WHERE run_id<? AND period_end>=? "
-              "AND period_end<?", (str(run_day), str(since), str(p1)))
-    adj = []
-    if len(prior):
-        prev = q("SELECT l.agent_id, l.date, SUM(l.reg_calc) reg, SUM(l.ot_calc) ot FROM payroll_lines l "
-                 "WHERE l.run_id IN (%s) GROUP BY l.agent_id, l.date" % ",".join("?" * len(prior)),
-                 tuple(prior.run_id))
-        prev_map = {(int(r.agent_id), str(r.date)): (float(r.reg or 0), float(r.ot or 0)) for r in prev.itertuples()}
-        cur_map = {}
-        for r in prior.itertuples():  # what those earlier days add up to now
-            cur = payroll_compute(dt.date.fromisoformat(r.period_start), dt.date.fromisoformat(r.period_end), run_day)
-            cur_map.update({(int(c.agent_id), str(c.date)): c for c in cur.itertuples()})
-        for key in sorted(set(prev_map) | set(cur_map), key=lambda k: (k[1], k[0])):
-            was_r, was_o = prev_map.get(key, (0.0, 0.0))
-            cur = cur_map.get(key)
-            dr = round((cur.reg_calc if cur is not None else 0) - was_r, 2)
-            do = round((cur.ot_calc if cur is not None else 0) - was_o, 2)
-            if abs(dr) < 0.01 and abs(do) < 0.01:
-                continue
-            g = (lambda f, dflt="": getattr(cur, f) if cur is not None else dflt)
-            adj.append(dict(agent_id=key[0], date=key[1], basis="Adjustment", schedule=g("schedule"),
-                            time_in=g("time_in"), time_out=g("time_out"), status=g("status"),
-                            late_min=g("late_min", 0), undertime_min=g("undertime_min", 0),
-                            logged_hrs=g("logged_hrs", None), reg_calc=dr, ot_calc=do,
-                            flags=f"Prior payroll had {was_r:g}h reg / {was_o:g}h OT for this day"
-                                  + (f"; {cur.flags}" if cur is not None and cur.flags else "")))
-    if adj:
-        lines = pd.concat([lines, pd.DataFrame(adj)], ignore_index=True)
-    lines["reg_final"], lines["ot_final"], lines["note"] = lines.reg_calc, lines.ot_calc, ""
-    return lines
-
-
-def payroll_generate(run_day, by="auto"):
-    """Create (or rebuild a draft of) the payroll report for the run on `run_day`."""
-    ex_run = q("SELECT status FROM payroll_runs WHERE run_id=?", (str(run_day),))
-    if len(ex_run) and ex_run.status.iloc[0] == "Final":
-        return False, "This payroll is already final — it can't be regenerated."
-    p1, p2 = payroll_period(run_day)
-    lines = payroll_build(run_day)
-    ex("DELETE FROM payroll_lines WHERE run_id=?", (str(run_day),))
-    ex("INSERT OR REPLACE INTO payroll_runs(run_id,period_start,period_end,cutoff,status,generated_at,generated_by) "
-       "VALUES(?,?,?,?,?,?,?)", (str(run_day), str(p1), str(p2), f"{run_day} 00:00", "Draft",
-                                  now_site().isoformat(timespec="seconds"), by))
-    if len(lines):
-        cols = ["agent_id", "date", "basis", "schedule", "time_in", "time_out", "status", "late_min", "undertime_min",
-                "logged_hrs", "reg_calc", "ot_calc", "reg_final", "ot_final", "flags", "note"]
-        vals = [[str(run_day)] + [None if (isinstance(v, float) and math.isnan(v)) else v for v in row]
-                for row in lines[cols].itertuples(index=False)]
-        exmany(f"INSERT INTO payroll_lines(run_id,{','.join(cols)}) VALUES(?{',?' * len(cols)})", vals)
-    return True, f"Payroll for {p1:%b %d}–{p2:%b %d} generated ({len(lines)} lines)."
-
-
-def payroll_auto():
-    """Runs on every page load: once a payroll cutoff (12:00 AM CT on the 10th / 25th) has passed,
-    lock that report automatically. Only for cutoffs in the last 3 days so old periods aren't back-filled."""
-    now = now_site()
-    due = [c for c in payroll_cutoffs(now.date(), back=1, ahead=0)
-           if dt.datetime.combine(c, dt.time()) <= now < dt.datetime.combine(c, dt.time()) + 3 * ONE_DAY]
-    for c in due:
-        if not len(q("SELECT 1 FROM payroll_runs WHERE run_id=?", (str(c),))):
-            try:
-                payroll_generate(c, by="auto (12:00 AM CT)")
-            except Exception:  # never block someone's page because of payroll
-                pass
-
-
-def payroll_tables(run_id):
-    lines = q("SELECT l.*, a.emp_id, a.name, a.account FROM payroll_lines l LEFT JOIN agents a ON a.id=l.agent_id "
-              "WHERE l.run_id=? ORDER BY a.name, l.date, l.basis", (run_id,))
-    for c in ("reg_calc", "ot_calc", "reg_final", "ot_final", "logged_hrs"):
-        lines[c] = pd.to_numeric(lines[c], errors="coerce")
-    if lines.empty:
-        return lines, pd.DataFrame()
-    lines["day"] = pd.to_datetime(lines.date).dt.strftime("%a")
-    g = lines.groupby(["agent_id", "emp_id", "name", "account"], dropna=False)
-
-    def part(basis, col):
-        return lines[lines.basis == basis].groupby("agent_id")[col].sum()
-    summ = g.size().reset_index()[["agent_id", "emp_id", "name", "account"]]
-    for basis, tag in (("Actual", "actual"), ("Projected", "projected"), ("Adjustment", "adj")):
-        summ[f"{tag}_reg"] = summ.agent_id.map(part(basis, "reg_final")).fillna(0).round(2)
-        summ[f"{tag}_ot"] = summ.agent_id.map(part(basis, "ot_final")).fillna(0).round(2)
-    summ["total_reg"] = (summ.actual_reg + summ.projected_reg + summ.adj_reg).round(2)
-    summ["total_ot"] = (summ.actual_ot + summ.projected_ot + summ.adj_ot).round(2)
-    summ["total_hrs"] = (summ.total_reg + summ.total_ot).round(2)
-    summ["logged_hrs_actual_days"] = summ.agent_id.map(part("Actual", "logged_hrs")).fillna(0).round(2)
-    summ["review_flags"] = summ.agent_id.map(lines[lines["flags"].fillna("") != ""].groupby("agent_id").size()) \
-        .fillna(0).astype(int)
-    return lines, summ.sort_values("name").reset_index(drop=True)
-
-
-def payroll_timesheet(run, lines):
-    """Their timesheet layout: one row per agent, one column per day.
-    submitted = what went to accounting (paid hours, reg + OT); rendered = what actually happened so far
-    (from the time clock, leave codes on leave days); notes = days that changed after submission."""
-    p1, p2 = dt.date.fromisoformat(run.period_start), dt.date.fromisoformat(run.period_end)
-    days = [p1 + dt.timedelta(days=i) for i in range((p2 - p1).days + 1)]
-    dcols = [str(d) for d in days]
-    base = lines[lines.basis != "Adjustment"]
-    adj = lines[lines.basis == "Adjustment"]
-    agents = lines[["agent_id", "name", "emp_id", "account"]].drop_duplicates("agent_id").sort_values("name")
-    today = today_site()
-    upto = min(p2, today - ONE_DAY)
-    cur = payroll_compute(p1, upto, today) if upto >= p1 else pd.DataFrame(columns=["agent_id", "date"])
-    cur_map = {(int(r.agent_id), str(r.date)): r for r in cur.itertuples()}
-    sub_rows, ren_rows, ot_rows = [], [], []
-    for a in agents.itertuples():
-        aid = int(a.agent_id)
-        mine = base[base.agent_id == aid]
-        by_day = {str(r.date): r for r in mine.itertuples()}
-        a_adj = adj[adj.agent_id == aid]
-        adj_total = round(float((a_adj.reg_final + a_adj.ot_final).sum()), 2)
-        adj_from = "| ".join(f"{dt.date.fromisoformat(r.date):%-m/%-d} ({r.reg_final + r.ot_final:+g})"
-                             for r in a_adj.itertuples())
-        sub = {"Name": a.name, "Adjustment": adj_total or None}
-        ren = {"Name": a.name}
-        otr = {"Name": a.name}
-        notes = []
-        reg_sum = ot_sum = 0.0
-        for d, ds in zip(days, dcols):
-            r = by_day.get(ds)
-            reg_f = float(r.reg_final) if r is not None else 0.0
-            ot_f = float(r.ot_final) if r is not None else 0.0
-            reg_sum, ot_sum = reg_sum + reg_f, ot_sum + ot_f
-            sub[ds] = round(reg_f + ot_f, 2)
-            otr[ds] = round(ot_f, 2) or None
-            if d > upto:
-                ren[ds] = None
-                continue
-            c = cur_map.get((aid, ds))
-            sched = str(c.schedule if c is not None else (r.schedule if r is not None else ""))
-            if sched.startswith("Leave"):
-                ren[ds] = leave_abbrev(sched)
-            else:
-                ren[ds] = round((c.reg_calc + c.ot_calc) if c is not None else 0.0, 2)
-            was = (float(r.reg_calc) + float(r.ot_calc)) if r is not None else 0.0
-            now_v = (c.reg_calc + c.ot_calc) if c is not None else 0.0
-            diff = round(now_v - was, 2)
-            if abs(diff) >= 0.01:
-                notes.append(f"{d:%-m/%-d} plotted {sub[ds]:g} rendered {sub[ds] + diff:g} ({diff:+g})")
-        sub["Reg"] = round(reg_sum, 2)
-        sub["OT"] = round(ot_sum, 2)
-        sub["TOTAL"] = round(reg_sum + ot_sum + adj_total, 2)
-        sub["Notes"] = "| ".join(notes)
-        sub["Adjustment from"] = adj_from
-        ren["Total"] = round(sum(v for k, v in ren.items() if k in dcols and isinstance(v, (int, float))), 2)
-        otr["OT total"] = round(ot_sum, 2)
-        sub_rows.append(sub)
-        ren_rows.append(ren)
-        ot_rows.append(otr)
-    return days, pd.DataFrame(sub_rows), pd.DataFrame(ren_rows), pd.DataFrame(ot_rows)
-
-
-def payroll_excel(run, lines, summ):
-    """Excel in the team's timesheet layout + OT tab + summary + daily detail."""
-    import io
-    from openpyxl import Workbook
-    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-    from openpyxl.utils import get_column_letter as L
-    sv = lambda v: "" if v is None or (isinstance(v, float) and math.isnan(v)) else str(v)
-    days, sub, ren, otd = payroll_timesheet(run, lines)
-    dcols = [str(d) for d in days]
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Timesheet"
-    bold, hdr = Font(bold=True), PatternFill("solid", fgColor="D9E1F2")
-    thin = Side(style="thin", color="BFBFBF")
-    box = Border(left=thin, right=thin, top=thin, bottom=thin)
-    title = f"{days[0]:%B %Y} CST · Pay period {days[0]:%b %-d}–{days[-1]:%b %-d}"
-    n = len(days)
-    # left block: Name, Adjustment, days..., Reg, OT, TOTAL, Notes, Adjustment from
-    left = ["Name", "Adjustment"] + dcols + ["Reg", "OT", "TOTAL", "Notes", "Adjustment from"]
-    gap = len(left) + 2
-    right = ["Name"] + dcols + ["Total"]
-    ws.cell(1, 1, title).font = Font(bold=True, size=13)
-    ws.cell(1, gap, "Rendered hours (from the time clock)").font = Font(bold=True, size=13)
-    for off, cols in ((1, left), (gap, right)):
-        for j, c in enumerate(cols):
-            col = off + j
-            if c in dcols:
-                d = dt.date.fromisoformat(c)
-                ws.cell(2, col, d.strftime("%a").upper())
-                ws.cell(3, col, d.day)
-            else:
-                ws.cell(2, col, "Employee's Name" if c == "Name" else "")
-                ws.cell(3, col, c)
-            for rr in (2, 3):
-                ws.cell(rr, col).font, ws.cell(rr, col).fill = bold, hdr
-                ws.cell(rr, col).alignment = Alignment(horizontal="center")
-                ws.cell(rr, col).border = box
-    r0 = 4
-    for i, row in enumerate(sub.to_dict("records")):
-        for j, c in enumerate(left):
-            v = row.get(c)
-            cell = ws.cell(r0 + i, 1 + j, None if v is None or (isinstance(v, float) and math.isnan(v)) else v)
-            cell.border = box
-            if c == "TOTAL":
-                cell.font = bold
-    for i, row in enumerate(ren.to_dict("records")):
-        for j, c in enumerate(right):
-            v = row.get(c)
-            ws.cell(r0 + i, gap + j, None if v is None or (isinstance(v, float) and math.isnan(v)) else v).border = box
-    tr = r0 + len(sub)
-    ws.cell(tr, 1, "Total Hours / per week").font = bold
-    for j, c in enumerate(left[1:], start=2):
-        if c in ("Notes", "Adjustment from"):
-            continue
-        ws.cell(tr, j, round(float(pd.to_numeric(sub[c], errors="coerce").sum()), 2)).font = bold
-    ws.cell(tr, gap, "Total Hours / per week").font = bold
-    for j, c in enumerate(right[1:], start=gap + 1):
-        ws.cell(tr, j, round(float(pd.to_numeric(ren[c], errors="coerce").sum()), 2)).font = bold
-    status = (f"TIMESHEET SUBMITTED {dt.datetime.fromisoformat(sv(run.finalized_at)):%-I:%M %p} CST "
-              f"{dt.datetime.fromisoformat(sv(run.finalized_at)):%-m/%-d}" if run.status == "Final" and sv(run.finalized_at)
-              else f"DRAFT — not yet submitted (locked {run.cutoff} CT)")
-    ws.cell(tr + 3, 1, status).font = Font(bold=True, color="C00000" if run.status != "Final" else "000000")
-    lr = tr + 5
-    ws.cell(lr, 1, "Name").font = bold
-    ws.cell(lr, 3, "Total Hrs").font = bold
-    for i, row in enumerate(sub.to_dict("records"), start=1):
-        ws.cell(lr + i, 1, row["Name"])
-        ws.cell(lr + i, 3, row["TOTAL"])
-    ws.column_dimensions["A"].width = 18
-    for j in range(2, gap + len(right) + 1):
-        ws.column_dimensions[L(j)].width = 7
-    ws.column_dimensions[L(left.index("Notes") + 1)].width = 50
-    ws.column_dimensions[L(left.index("Adjustment from") + 1)].width = 30
-    ws.column_dimensions[L(gap)].width = 18
-    ws.freeze_panes = "C4"
-
-    def put(sheet_name, df, start=0, header_rows=None):
-        w = wb.create_sheet(sheet_name)
-        for k, (a, b) in enumerate(header_rows or [], start=1):
-            w.cell(k, 1, a).font = bold
-            w.cell(k, 2, b)
-        start = len(header_rows or []) + (1 if header_rows else 0)
-        for j, c in enumerate(df.columns, start=1):
-            cell = w.cell(start + 1, j, c)
-            cell.font, cell.fill = bold, hdr
-            w.column_dimensions[L(j)].width = min(max(10, len(str(c)) + 2), 45)
-        for i, row in enumerate(df.itertuples(index=False), start=start + 2):
-            for j, v in enumerate(row, start=1):
-                w.cell(i, j, None if v is None or (isinstance(v, float) and math.isnan(v)) else v)
-        return w
-
-    ot_view = otd.rename(columns={c: f"{dt.date.fromisoformat(c):%a %-m/%-d}" for c in dcols})
-    put("OT", ot_view)
-    s_cols = {"emp_id": "Username/Emp ID", "name": "Name", "account": "Account", "actual_reg": "Actual reg hrs",
-              "actual_ot": "Actual OT hrs", "projected_reg": "Projected reg hrs", "projected_ot": "Projected OT hrs",
-              "adj_reg": "Prior-period adj reg hrs", "adj_ot": "Prior-period adj OT hrs", "total_reg": "TOTAL reg hrs",
-              "total_ot": "TOTAL OT hrs", "total_hrs": "TOTAL hrs (combined)",
-              "logged_hrs_actual_days": "Logged hrs (actual days)", "review_flags": "Items to review"}
-    put("Summary", summ[list(s_cols)].rename(columns=s_cols), header_rows=[
-        ("Pay period", f"{run.period_start} to {run.period_end}"), ("Cutoff", f"{run.cutoff} CT"),
-        ("Status", run.status), ("Generated", f"{sv(run.generated_at)} ({sv(run.generated_by)})"),
-        ("Finalized", f"{sv(run.finalized_at)} by {sv(run.finalized_by)}" if sv(run.finalized_by) else "")])
-    d_cols = {"name": "Name", "emp_id": "Username/Emp ID", "date": "Date", "day": "Day", "basis": "Basis",
-              "schedule": "Schedule", "time_in": "In", "time_out": "Out", "status": "Status", "late_min": "Late (min)",
-              "undertime_min": "Undertime (min)", "logged_hrs": "Logged hrs", "reg_calc": "Reg hrs (calc)",
-              "ot_calc": "OT hrs (calc)", "reg_final": "Reg hrs (paid)", "ot_final": "OT hrs (paid)",
-              "flags": "Review", "note": "Note"}
-    put("Daily detail", lines[list(d_cols)].rename(columns=d_cols))
-    buf = io.BytesIO()
-    wb.save(buf)
-    return buf.getvalue()
-
-
-def page_payroll(acct):
-    st.header("💵 Payroll")
-    st.caption("Sent to accounting on the **10th** (covers 1st–15th) and the **25th** (covers 16th–end of month). "
-               "The report locks automatically at **12:00 AM Central** on those days. Days before the cutoff use "
-               "what actually happened — scheduled hours minus late and undertime (breaks are paid) plus approved OT "
-               "that was worked. Days after the cutoff are projected from the schedule, approved leave and approved OT. "
-               "Anything that changes later shows up as a **prior-period adjustment** on the next payroll.")
-    runs = q("SELECT * FROM payroll_runs ORDER BY run_id DESC")
-    today = today_site()
-    cands = [c for c in payroll_cutoffs(today, back=3, ahead=0) if c <= today]
-    have = set(runs.run_id) if len(runs) else set()
-    with st.expander("➕ Generate a payroll report", expanded=runs.empty):
-        missing = [c for c in reversed(cands) if str(c) not in have]
-        if not missing:
-            st.caption("All recent payroll reports exist. Open a draft below to recalculate it.")
-        else:
-            fmt = lambda c: f"Run {c:%b %d} · covers {payroll_period(c)[0]:%b %d}–{payroll_period(c)[1]:%b %d}"
-            pick = st.selectbox("Payroll", missing, format_func=fmt, key="pr_new")
-            st.caption("Normally this happens on its own at 12:00 AM CT. Use this for a missed or past period.")
-            if st.button("Generate", type="primary", key="pr_gen"):
-                ok, msg = payroll_generate(pick, by=f"admin:{current_user()['username']}")
-                (st.success if ok else st.error)(msg)
-                rerun()
-    if runs.empty:
-        st.info("No payroll reports yet.")
-        return
-    lab = {r.run_id: f"{dt.date.fromisoformat(r.period_start):%b %d}–{dt.date.fromisoformat(r.period_end):%b %d, %Y}"
-                     f" · sent {dt.date.fromisoformat(r.run_id):%b %d} · {r.status}" for r in runs.itertuples()}
-    rid = st.selectbox("Payroll report", list(lab), format_func=lab.get, key="pr_run")
-    run = runs[runs.run_id == rid].iloc[0]
-    lines, summ = payroll_tables(rid)
-    if acct != "All accounts" and len(lines):
-        lines, summ = lines[lines.account == acct], summ[summ.account == acct]
-    final = run.status == "Final"
-    k = st.columns(5)
-    k[0].metric("Status", "✅ Final" if final else "📝 Draft")
-    k[1].metric("Agents", len(summ))
-    k[2].metric("Regular hrs", f"{summ.total_reg.sum():,.2f}" if len(summ) else "0")
-    k[3].metric("OT hrs", f"{summ.total_ot.sum():,.2f}" if len(summ) else "0")
-    k[4].metric("Items to review", int(summ.review_flags.sum()) if len(summ) else 0)
-    st.caption(f"Cutoff {run.cutoff} CT · actual days {run.period_start} to "
-               f"{dt.date.fromisoformat(rid) - ONE_DAY} · projected {rid} to {run.period_end} · generated "
-               f"{run.generated_at} by {run.generated_by}"
-               + (f" · finalized {run.finalized_at} by {run.finalized_by}" if final else ""))
-    if summ.empty:
-        st.info("Nothing to pay in this period.")
-        return
-    t0, t1, t2, t3 = st.tabs(["Timesheet", "Summary", "Daily detail & rounding", "Items to review"])
-    with t0:
-        days_, sub_, ren_, _ot = payroll_timesheet(run, lines)
-        nice = {str(d): f"{d:%a} {d.day}" for d in days_}
-        st.caption("**Submitted** (what goes to accounting): paid hours per day, regular + OT combined. "
-                   "**Adjustment** carries changes from earlier payrolls. **Notes** list days that changed after this "
-                   "report was locked — they become next payroll's adjustment.")
-        st.dataframe(sub_.rename(columns=nice), hide_index=True, width="stretch")
-        st.markdown("**Rendered so far** (from the time clock; leave shows its code)")
-        st.dataframe(ren_.rename(columns=nice).map(lambda v: "" if v is None or (isinstance(v, float) and math.isnan(v))
-                                                   else f"{v:g}" if isinstance(v, (int, float)) else str(v)),
-                     hide_index=True, width="stretch")
-    with t1:
-        st.dataframe(summ.drop(columns="agent_id"), hide_index=True, width="stretch", column_config={
-            "emp_id": "Username/Emp ID", "actual_reg": "Actual reg", "actual_ot": "Actual OT",
-            "projected_reg": "Projected reg", "projected_ot": "Projected OT", "adj_reg": "Adj reg",
-            "adj_ot": "Adj OT", "total_reg": "TOTAL reg", "total_ot": "TOTAL OT", "total_hrs": "TOTAL hrs",
-            "logged_hrs_actual_days": "Logged hrs (actual days)", "review_flags": "To review"})
-    with t2:
-        st.caption("**Reg/OT (calc)** is what the system worked out. **Paid** is what goes to accounting — "
-                   "round or correct it here before finalizing. Rounding doesn't create adjustments later; "
-                   "only real changes (attendance, OT, leave, schedule) do.")
-        view = lines[["name", "date", "day", "basis", "schedule", "time_in", "time_out", "status", "late_min",
-                      "undertime_min", "logged_hrs", "reg_calc", "ot_calc", "reg_final", "ot_final", "flags", "note",
-                      "agent_id"]]
-        if not final:
-            c = st.columns([2, 1, 3])
-            step = c[0].selectbox("Round paid hours to nearest", ["0.25 h", "0.5 h", "1 h"], key="pr_step")
-            if c[1].button("Apply rounding", key="pr_round"):
-                stp = float(step.split()[0])
-                for r in lines.itertuples():
-                    ex("UPDATE payroll_lines SET reg_final=?, ot_final=? WHERE run_id=? AND agent_id=? AND date=? "
-                       "AND basis=?", (round(round(r.reg_final / stp) * stp, 2), round(round(r.ot_final / stp) * stp, 2),
-                                      rid, int(r.agent_id), r.date, r.basis))
-                rerun()
-        ed = st.data_editor(view, hide_index=True, width="stretch", key=f"pr_ed_{rid}",
-                            disabled=final or [c for c in view.columns if c not in ("reg_final", "ot_final", "note")],
-                            column_config={"agent_id": None, "reg_calc": "Reg (calc)", "ot_calc": "OT (calc)",
-                                           "reg_final": st.column_config.NumberColumn("Reg (paid)", step=0.25),
-                                           "ot_final": st.column_config.NumberColumn("OT (paid)", step=0.25),
-                                           "logged_hrs": "Logged hrs", "late_min": "Late", "undertime_min": "UT",
-                                           "flags": "Review"})
-        if not final and st.button("💾 Save changes", key="pr_save"):
-            n = 0
-            for r in ed.itertuples():
-                ex("UPDATE payroll_lines SET reg_final=?, ot_final=?, note=? WHERE run_id=? AND agent_id=? AND date=? "
-                   "AND basis=?", (float(r.reg_final or 0), float(r.ot_final or 0), r.note or "", rid,
-                                  int(r.agent_id), r.date, r.basis))
-                n += 1
-            st.success("Saved.")
-            rerun()
-    with t3:
-        rev = lines[lines["flags"].fillna("") != ""][["name", "date", "basis", "schedule", "status", "reg_final",
-                                                   "ot_final", "flags"]]
-        if rev.empty:
-            st.success("Nothing flagged.")
-        else:
-            st.dataframe(rev, hide_index=True, width="stretch")
-    xls = payroll_excel(run, *payroll_tables(rid))
-    fname = f"payroll_{run.period_start}_to_{run.period_end}{'' if final else '_DRAFT'}.xlsx"
-    c = st.columns(3)
-    c[0].download_button("⬇️ Download Excel", xls, fname, width="stretch",
-                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    if not final:
-        if c[1].button("🔄 Recalculate draft", width="stretch", key="pr_recalc",
-                       help="Rebuilds the numbers from current data. Rounding and notes you made are reset."):
-            payroll_generate(dt.date.fromisoformat(rid), by=f"admin:{current_user()['username']}")
-            rerun()
-        if c[2].button("✅ Finalize (sent to accounting)", type="primary", width="stretch", key="pr_final"):
-            ex("UPDATE payroll_runs SET status='Final', finalized_at=?, finalized_by=? WHERE run_id=?",
-               (now_site().isoformat(timespec="seconds"), current_user()["username"], rid))
-            rerun()
 
 
 # ----------------------------------------------------------------- layout
@@ -4964,7 +4670,6 @@ ADMIN_PAGES = {
     "🧩 Coverage Finder": page_coverage,
     "⏰ Overtime": page_ot,
     "📈 Reports": page_reports,
-    "💵 Payroll": page_payroll,
     "👥 Roster & Accounts": lambda acct: page_roster(),
     "🔐 Users": page_users,
     "⚙️ Settings": lambda acct: page_settings(),
@@ -4976,7 +4681,6 @@ AGENT_PAGES = {
     "🔑 My password": lambda acct: page_change_password(),
 }
 PAGES = ADMIN_PAGES if is_admin() else AGENT_PAGES  # agents never get the admin pages
-payroll_auto()  # locks the 10th / 25th payroll at 12:00 AM CT — whoever opens the app first (agents work 24/7)
 if is_admin():
     sync_current_schedules()  # roster shows the permanent schedule in effect today (cheap; writes only on change)
 
