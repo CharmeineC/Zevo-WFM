@@ -3583,6 +3583,32 @@ def auth_gate():
                         st.rerun()
             st.caption("Agents: log in, take breaks and file time off or OT. Admins: schedules, attendance and "
                        "reports. Forgot your password? Ask an admin to reset it.")
+            setup_code = str(secret("setup_code") or "")
+            if want == "admin" and setup_code:
+                with st.expander("Admin: forgot your password?"):
+                    st.caption("Use the **setup code** from the app's Secrets to set a new password for an admin login.")
+                    with st.form("admin_recover"):
+                        run = st.text_input("Admin username", key="rec_user")
+                        code = st.text_input("Setup code", type="password", key="rec_code")
+                        npw = st.text_input("New password", type="password", key="rec_pw")
+                        npw2 = st.text_input("Repeat new password", type="password", key="rec_pw2")
+                        if st.form_submit_button("Reset admin password"):
+                            target = get_user(run.strip()) if run.strip() else None
+                            prob = pw_problem(npw)
+                            if not hmac.compare_digest(code, setup_code):
+                                st.error("Wrong setup code.")
+                            elif target is None or target["role"] != "admin":
+                                st.error("No admin login with that username.")
+                            elif prob:
+                                st.error(prob)
+                            elif npw != npw2:
+                                st.error("Passwords don't match.")
+                            else:
+                                ex("UPDATE users SET pw_hash=?, must_change=0, failed=0, locked_until=NULL, active=1 "
+                                   "WHERE username=?", (hash_pw(npw), target["username"]))
+                                end_user_sessions(target["username"])
+                                flush_to_sheet(sync=True)
+                                st.success("Password changed — sign in above with your new password.")
     st.stop()
 
 
@@ -4441,7 +4467,8 @@ def page_users(acct):
             admins_active = int(((users.role == "admin") & (users.active.fillna(0).astype(int) == 1)).sum())
             last_admin = row.role == "admin" and active and admins_active <= 1
             c = st.columns(4)
-            if c[0].button("🔁 Reset password", key="mg_reset"):
+            if c[0].button("🔁 Reset password", key="mg_reset", disabled=pick == me,
+                           help="To change your own password use 🔑 My password" if pick == me else None):
                 pw = temp_password()
                 ex("UPDATE users SET pw_hash=?, must_change=1, failed=0, locked_until=NULL WHERE username=?",
                    (hash_pw(pw), pick))
@@ -4462,7 +4489,8 @@ def page_users(acct):
                 end_user_sessions(pick)
                 rerun()
             if pick == me or last_admin:
-                st.caption("You can't disable or delete your own login or the last active admin.")
+                st.caption("You can't reset, disable or delete your own login (use **🔑 My password**), "
+                           "or disable/delete the last active admin.")
 
 
 def page_clock_logs(acct):
